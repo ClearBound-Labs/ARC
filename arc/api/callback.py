@@ -19,6 +19,7 @@
 from typing import Dict, Any, Optional, Union
 import time
 import os
+import warnings
 import torch
 import torch.nn as nn
 
@@ -35,6 +36,7 @@ from arc.signals import (
 from arc.features.buffer import SignalBuffer, EpochSnapshot
 from arc.prediction.predictor import FailurePredictor, FailurePrediction
 from arc.intervention.recommender import InterventionRecommender
+from arc._logging import log as _log
 
 class Arc:
     def __init__(
@@ -68,23 +70,20 @@ class Arc:
         self._training_total = 0.0
 
     def _init_collectors(self) -> None:
+        self._loss_collector = LossCollector(self.config.signal)
+
         self.collectors = CompositeCollector([
             GradientCollector(self.config.signal),
             ActivationCollector(self.config.signal),
             WeightCollector(self.config.signal),
             OptimizerCollector(self.config.signal),
-            LossCollector(self.config.signal),
+            self._loss_collector,
         ])
 
         if self.config.signal.compute_curvature_proxy:
             self.collectors.collectors.append(
                 CurvatureCollector(self.config.signal)
             )
-
-        self._loss_collector = next(
-            c for c in self.collectors.collectors
-            if isinstance(c, LossCollector)
-        )
 
     def _init_predictor(self, model_path: Optional[str]) -> None:
         self.predictor = FailurePredictor(
@@ -108,9 +107,9 @@ class Arc:
         self._training_start_time = time.time()
 
         if self.verbose:
-            print(f"Arc attached to {model.__class__.__name__}")
-            print(f"Device: {self.device}")
-            print(f"Signal collectors: {len(self.collectors.collectors)}")
+            _log(f"Arc attached to {model.__class__.__name__}")
+            _log(f"Device: {self.device}")
+            _log(f"Signal collectors: {len(self.collectors.collectors)}")
 
         return self
 
@@ -123,7 +122,7 @@ class Arc:
                 overhead_pct = (
                     self._overhead_total / max(self._training_total, 1e-6) * 100
                 )
-                print(f"Arc detached. Overhead: {overhead_pct:.2f}%")
+                _log(f"Arc detached. Overhead: {overhead_pct:.2f}%")
 
     def on_batch_end(
         self,
@@ -199,15 +198,15 @@ class Arc:
         mode, prob = prediction.get_highest_risk_mode()
 
         icon = "⚠️" if prediction.risk_level == 'high' else "🚨"
-        print(f"\n{icon} Arc Warning (Epoch {prediction.epoch}):")
-        print(f"   Risk: {prediction.risk_level.upper()} ({prob:.1%} {mode})")
-        print(f"   Recommendation: {prediction.recommendation.action}")
-        print(f"   Rationale: {prediction.recommendation.rationale}")
+        _log(f"\n{icon} Arc Warning (Epoch {prediction.epoch}):")
+        _log(f"   Risk: {prediction.risk_level.upper()} ({prob:.1%} {mode})")
+        _log(f"   Recommendation: {prediction.recommendation.action}")
+        _log(f"   Rationale: {prediction.recommendation.rationale}")
 
         if prediction.top_contributors:
-            print("   Top signals:")
+            _log("   Top signals:")
             for c in prediction.top_contributors[:2]:
-                print(f"     - {c.signal_name}: {c.interpretation}")
+                _log(f"     - {c.signal_name}: {c.interpretation}")
 
     def _apply_intervention(self, prediction: FailurePrediction) -> None:
         action = prediction.recommendation.action
@@ -218,11 +217,21 @@ class Arc:
                 group['lr'] *= params.get('lr_factor', 0.5)
 
             if self.verbose:
-                print(f"Applied intervention: Learning rate reduced")
+                _log(f"Applied intervention: Learning rate reduced")
 
         elif action == "enable_gradient_clipping":
             if self.verbose:
-                print(f"Suggested intervention: Enable gradient clipping (max_norm={params.get('clip_max_norm', 1.0)})")
+                _log(f"Suggested intervention: Enable gradient clipping (max_norm={params.get('clip_max_norm', 1.0)})")
+
+        elif action != "no_action":
+            # Recommender can propose actions (add_regularization, early_stop,
+            # manual_review, ...) this callback doesn't act on automatically.
+            # Surface that instead of silently dropping the recommendation.
+            warnings.warn(
+                f"Arc recommended intervention '{action}' but no automatic "
+                f"handler is implemented for it; no action was taken.",
+                stacklevel=2,
+            )
 
     def get_report(self) -> str:
         from arc.api.report import ReportGenerator

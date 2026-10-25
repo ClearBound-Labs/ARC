@@ -17,6 +17,7 @@
 # along with ARC. If not, see <https://www.gnu.org/licenses/>.
 
 from typing import Dict, Any, Optional, List
+import warnings
 import torch
 import torch.nn as nn
 import numpy as np
@@ -129,8 +130,8 @@ class CurvatureCollector(SignalCollector):
                         hvp_signals["max_hvp_norm"] / hvp_signals["min_hvp_norm"]
                     )
 
-        except Exception:
-            pass
+        except Exception as e:
+            warnings.warn(f"HVP curvature computation failed: {e}")
 
         return hvp_signals
 

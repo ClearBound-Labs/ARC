@@ -16,10 +16,8 @@ Two layers of tests:
    If a future refactor drops or weakens the flag in any wrapper, the
    corresponding test fails.
 
-The fallback path (``weights_only=False`` after ``pickle.UnpicklingError``
-or a recognised ``RuntimeError``) is intentionally permissive for backward
-compatibility with checkpoints that include optimizer state or other
-non-tensor objects. See SECURITY.md for the full trust boundary.
+There is no automatic ``weights_only=False`` fallback; unsafe loading is an
+explicit opt-in (see tests/test_safe_load.py and SECURITY.md).
 """
 
 from __future__ import annotations
@@ -179,11 +177,11 @@ def test_failure_predictor_attempts_weights_only(tmp_path: Path) -> None:
 def test_adaptive_checkpointer_attempts_weights_only(tmp_path: Path) -> None:
     """``AdaptiveCheckpointer.restore`` must call ``torch.load`` with
     ``weights_only=True`` on the first attempt."""
-    from arc.checkpointing.adaptive import AdaptiveCheckpointer
+    from arc.checkpointing.adaptive import AdaptiveCheckpointer, AdaptiveCheckpointConfig
 
-    # Bypass __init__ — restore() reads self.checkpoints[idx]['path'].
-    cp = AdaptiveCheckpointer.__new__(AdaptiveCheckpointer)
-    cp.device = "cpu"
+    model = nn.Linear(2, 2)
+    cp = AdaptiveCheckpointer(model, torch.optim.SGD(model.parameters(), lr=0.1),
+                              AdaptiveCheckpointConfig(verbose=False, disk_checkpoint_dir=str(tmp_path)))
 
     safe_path = tmp_path / "adaptive_safe.pt"
     torch.save(
@@ -199,11 +197,7 @@ def test_adaptive_checkpointer_attempts_weights_only(tmp_path: Path) -> None:
 
     spy, captured, _ = _record_torch_load_kwargs("arc.checkpointing.adaptive.torch.load")
     with patch("arc.checkpointing.adaptive.torch.load", side_effect=spy):
-        try:
-            cp.restore(0)
-        except AttributeError:
-            pass  # expected — __new__'d instance lacks self.config/self.model
-                # that restore() touches after the load completes
+        cp.restore(0)
 
     assert captured, "AdaptiveCheckpointer.restore never called torch.load"
     assert captured[0].get("weights_only") is True, (

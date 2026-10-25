@@ -349,8 +349,8 @@ class ExperimentRunner:
         arc_network = None
         if self.use_arc_network:
             try:
-                from arc.introspection import Arc
-                arc_network = Arc(
+                from arc.introspection import IntrospectiveArc
+                arc_network = IntrospectiveArc(
                     model,
                     optimizer=optimizer,
                     enable_geometry=True,

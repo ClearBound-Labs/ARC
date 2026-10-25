@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arc-training"
-version = "4.0.0"
+version = "5.2.0"
 description = "Automatic Recovery Controller - Auto-detect and recover from neural network training failures"
 readme = "README.md"
 license = {text = "AGPL-3.0-or-later"}
@@ -27,39 +27,38 @@ classifiers = [
     "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
-    "torch>=1.9.0",
-    "numpy>=1.19.0",
+    "torch>=2.4",
+    "numpy>=1.23",
+    "scipy>=1.9",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=6.0",
-    "pytest-cov>=2.0",
-    "black>=21.0",
-    "isort>=5.0",
-    "mypy>=0.900",
+hf = [
+    "transformers>=4.44",
+    "accelerate>=0.33",
 ]
 lightning = [
-    "pytorch-lightning>=1.5.0",
+    "lightning>=2.2",
 ]
-full = [
-    "scipy>=1.7.0",
-    "tqdm>=4.0.0",
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "build",
+    "twine",
 ]
 
 [project.urls]
-Homepage = "https://github.com/a-kaushik2209/ARC"
-Documentation = "https://arc-training.readthedocs.io"
+Homepage = "https://pyarc.pages.dev"
+Documentation = "https://pyarc.pages.dev/docs.html"
 Repository = "https://github.com/a-kaushik2209/ARC"
 Changelog = "https://github.com/a-kaushik2209/ARC/blob/master/CHANGELOG.md"
 
@@ -70,18 +69,9 @@ include = ["arc*"]
 [tool.setuptools.package-data]
 arc = ["py.typed"]
 
-[tool.black]
-line-length = 100
-target-version = ['py38', 'py39', 'py310', 'py311']
-
-[tool.isort]
-profile = "black"
-line_length = 100
-
-[tool.mypy]
-python_version = "3.8"
-warn_return_any = true
-warn_unused_configs = true
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+    # legacy APIs exercised on purpose by their own tests
+    "ignore:(SelfHealingArc|LiteArc) is a legacy API:FutureWarning",
+]

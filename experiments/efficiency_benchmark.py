@@ -37,7 +37,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from arc.introspection import Arc, create_self_aware_model
+from arc.introspection import IntrospectiveArc as Arc, create_self_aware_model
 
 def get_simple_model():
     return nn.Sequential(

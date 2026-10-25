@@ -16,180 +16,185 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with ARC. If not, see <https://www.gnu.org/licenses/>.
 
+"""Framework integrations.
+
+The Hugging Face and Lightning callbacks run `arc.Controller` in the hook that
+fires after backward/clipping and *before* the optimizer step. On a failure
+they roll back and clear every ``.grad``: torch optimizers skip parameters
+whose grad is None, so the poisoned update never happens.
+
+Neither framework hands the loss to that hook, so these callbacks check
+gradients, weights and training dynamics (NaN/Inf, explosions, weight
+corruption, Lyapunov, trends) rather than the loss value. With the trainers'
+default gradient clipping on, an exploding-but-finite gradient is already
+clipped by the time ARC sees it; NaN/Inf is still caught.
+"""
+
+import copy
+import dataclasses
+import logging
+import warnings
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
+
 import torch
 import torch.nn as nn
-from typing import Optional, Dict, Any, Callable, Union
-from dataclasses import dataclass
-import warnings
+
+from arc.core.controller import Controller, ControllerConfig
+from arc._logging import log
 
 try:
-    from transformers import TrainerCallback, TrainerState, TrainerControl, TrainingArguments
-    from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+    from transformers import TrainerCallback
     HF_AVAILABLE = True
 except ImportError:
     HF_AVAILABLE = False
     TrainerCallback = object
 
-class HuggingFaceCallback(TrainerCallback if HF_AVAILABLE else object):
+try:
+    from lightning.pytorch.callbacks import Callback as _LightningBase
+    LIGHTNING_AVAILABLE = True
+except ImportError:
+    try:
+        from pytorch_lightning.callbacks import Callback as _LightningBase
+        LIGHTNING_AVAILABLE = True
+    except ImportError:
+        LIGHTNING_AVAILABLE = False
+        _LightningBase = object
+
+
+def _callback_config(
+    config: Optional[ControllerConfig],
+    verbose: bool,
+    loss_threshold: Optional[float],
+    gradient_threshold: Optional[float],
+) -> ControllerConfig:
+    cfg = copy.deepcopy(config) if config is not None else ControllerConfig()
+    cfg.verbose = verbose
+    if loss_threshold is not None:
+        cfg.loss_explosion_threshold = loss_threshold
+    if gradient_threshold is not None:
+        cfg.gradient_explosion_threshold = gradient_threshold
+    if loss_threshold is not None or gradient_threshold is not None:
+        cfg.auto_calibrate = False  # explicit thresholds win
+    return cfg
+
+
+def _skip_optimizer_step(model: nn.Module) -> None:
+    for p in model.parameters():
+        p.grad = None
+
+
+class HuggingFaceCallback(TrainerCallback):
+    """`transformers.Trainer` callback backed by `arc.Controller`.
+
+        trainer = Trainer(..., callbacks=[HuggingFaceCallback()])
+    """
+
     def __init__(
         self,
-        loss_threshold: float = 100.0,
-        gradient_threshold: float = 1e4,
-        lr_spike_factor: float = 100.0,
+        config: Optional[ControllerConfig] = None,
         enable_rollback: bool = True,
         verbose: bool = True,
+        loss_threshold: Optional[float] = None,
+        gradient_threshold: Optional[float] = None,
+        lr_spike_factor: Optional[float] = None,
     ):
         if not HF_AVAILABLE:
             raise ImportError("transformers package required for HuggingFaceCallback")
-
         super().__init__()
-
-        self.loss_threshold = loss_threshold
-        self.gradient_threshold = gradient_threshold
-        self.lr_spike_factor = lr_spike_factor
+        if lr_spike_factor is not None:
+            warnings.warn("lr_spike_factor is no longer used and is ignored", DeprecationWarning,
+                          stacklevel=2)
         self.enable_rollback = enable_rollback
         self.verbose = verbose
+        self._config = _callback_config(config, verbose, loss_threshold, gradient_threshold)
+        self.controller: Optional[Controller] = None
+        self.skipped_steps = 0
 
-        self._initial_lr = None
-        self._last_loss = None
-        self._rollback_count = 0
-        self._last_good_step = 0
-        self._loss_history = []
-
-        self._rollback = None
-
-    def on_train_begin(self, args, state, control, model=None, optimizer=None, **kwargs):
-        if model is not None and optimizer is not None and self.enable_rollback:
-            from arc.intervention.rollback import WeightRollback, RollbackConfig
-
-            config = RollbackConfig(
-                loss_explosion_threshold=self.loss_threshold,
-                gradient_explosion_threshold=self.gradient_threshold,
-                lr_spike_factor=self.lr_spike_factor,
-                checkpoint_frequency=50,
-                fast_grad_norm=True,
-            )
-            self._rollback = WeightRollback(model, optimizer, config, verbose=False)
-
-            for pg in optimizer.param_groups:
-                self._initial_lr = pg['lr']
-                break
-
-            if self.verbose:
-                print(f"  ARC HuggingFace Callback: Protection enabled (loss_threshold={self.loss_threshold})")
-
-    def on_step_end(self, args, state, control, model=None, optimizer=None, **kwargs):
-        if self._rollback is None:
+    def on_train_begin(self, args, state, control, model=None, optimizer=None,
+                       lr_scheduler=None, **kwargs):
+        if not self.enable_rollback or model is None or optimizer is None:
             return
+        cfg = copy.deepcopy(self._config)
+        cfg.external_grad_scaler = bool(getattr(args, "fp16", False))
+        # Trainer wraps the torch optimizer (accelerate's AcceleratedOptimizer);
+        # ARC hooks the real one so its snapshot hooks fire.
+        torch_optimizer = getattr(optimizer, "optimizer", optimizer)
+        self.controller = Controller(model, torch_optimizer, scheduler=lr_scheduler, config=cfg)
 
-        if state.log_history:
-            last_log = state.log_history[-1]
-            if 'loss' in last_log:
-                loss = last_log['loss']
-                self._loss_history.append(loss)
-
-                loss_tensor = torch.tensor(loss)
-                action = self._rollback.step(loss_tensor)
-
-                if action.rolled_back:
-                    self._rollback_count += 1
-                    if self.verbose:
-                        print(f"  ARC: Rollback #{self._rollback_count} at step {state.global_step} ({action.failure_type})")
-
-                    control.should_training_stop = False
-                else:
-                    self._last_good_step = state.global_step
-
-    def on_epoch_end(self, args, state, control, **kwargs):
-        if self._rollback is not None:
-            self._rollback.end_epoch()
+    def on_pre_optimizer_step(self, args, state, control, model=None, **kwargs):
+        if self.controller is None:
+            return
+        action = self.controller.step(None)
+        if action.should_skip:
+            _skip_optimizer_step(self.controller.model)
+            self.skipped_steps += 1
 
     def on_train_end(self, args, state, control, **kwargs):
-        if self.verbose and self._rollback is not None:
-            stats = self._rollback.get_stats()
-            print(f"  ARC Summary: {stats['total_rollbacks']} rollbacks, {stats['checkpoints_saved']} checkpoints")
+        if self.controller is not None:
+            self.controller.close()
+            if self.verbose:
+                self.controller.summary()
 
-try:
-    import pytorch_lightning as pl
-    from pytorch_lightning.callbacks import Callback
-    LIGHTNING_AVAILABLE = True
-except ImportError:
-    LIGHTNING_AVAILABLE = False
-    Callback = object
 
-class LightningCallback(Callback if LIGHTNING_AVAILABLE else object):
+class LightningCallback(_LightningBase):
+    """Lightning callback backed by `arc.Controller`.
+
+        trainer = L.Trainer(..., callbacks=[LightningCallback()])
+    """
+
     def __init__(
         self,
-        loss_threshold: float = 100.0,
-        gradient_threshold: float = 1e4,
+        config: Optional[ControllerConfig] = None,
         enable_rollback: bool = True,
         verbose: bool = True,
+        loss_threshold: Optional[float] = None,
+        gradient_threshold: Optional[float] = None,
     ):
         if not LIGHTNING_AVAILABLE:
-            raise ImportError("pytorch_lightning package required for LightningCallback")
-
+            raise ImportError("lightning (or pytorch_lightning) is required for LightningCallback")
         super().__init__()
-
-        self.loss_threshold = loss_threshold
-        self.gradient_threshold = gradient_threshold
         self.enable_rollback = enable_rollback
         self.verbose = verbose
-
-        self._rollback = None
-        self._rollback_count = 0
+        self._config = _callback_config(config, verbose, loss_threshold, gradient_threshold)
+        self.controller: Optional[Controller] = None
+        self.skipped_steps = 0
 
     def on_train_start(self, trainer, pl_module):
-        if self.enable_rollback:
-            from arc.intervention.rollback import WeightRollback, RollbackConfig
-
-            config = RollbackConfig(
-                loss_explosion_threshold=self.loss_threshold,
-                gradient_explosion_threshold=self.gradient_threshold,
-                checkpoint_frequency=50,
-                fast_grad_norm=True,
-            )
-
-            optimizers = trainer.optimizers
-            if optimizers:
-                optimizer = optimizers[0] if isinstance(optimizers, list) else optimizers
-                self._rollback = WeightRollback(pl_module, optimizer, config, verbose=False)
-
-                if self.verbose:
-                    print(f"  ARC Lightning Callback: Protection enabled")
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if self._rollback is None:
+        if not self.enable_rollback or not trainer.optimizers:
             return
+        if len(trainer.optimizers) > 1:
+            warnings.warn("ARC protects the first optimizer only", stacklevel=2)
+        scheduler = None
+        if getattr(trainer, "lr_scheduler_configs", None):
+            scheduler = trainer.lr_scheduler_configs[0].scheduler
+        cfg = copy.deepcopy(self._config)
+        # Lightning unscales before on_before_optimizer_step; its fp16 scaler
+        # skips overflowing steps itself.
+        cfg.external_grad_scaler = str(trainer.precision).startswith("16")
+        self.controller = Controller(pl_module, trainer.optimizers[0], scheduler=scheduler,
+                                     config=cfg)
 
-        loss = None
-        if isinstance(outputs, dict) and 'loss' in outputs:
-            loss = outputs['loss']
-        elif isinstance(outputs, torch.Tensor):
-            loss = outputs
-        elif hasattr(outputs, 'loss'):
-            loss = outputs.loss
-
-        if loss is not None:
-            if isinstance(loss, torch.Tensor):
-                action = self._rollback.step(loss.detach())
-            else:
-                action = self._rollback.step(torch.tensor(loss))
-
-            if action.rolled_back:
-                self._rollback_count += 1
-                if self.verbose:
-                    print(f"  ARC: Rollback #{self._rollback_count} at batch {batch_idx}")
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        if self._rollback is not None:
-            self._rollback.end_epoch()
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer):
+        optimizer = getattr(optimizer, "_optimizer", optimizer)  # LightningOptimizer
+        if self.controller is None or optimizer is not self.controller.optimizer:
+            return
+        action = self.controller.step(None)
+        if action.should_skip:
+            _skip_optimizer_step(pl_module)
+            self.skipped_steps += 1
 
     def on_train_end(self, trainer, pl_module):
-        if self.verbose and self._rollback is not None:
-            stats = self._rollback.get_stats()
-            print(f"  ARC Summary: {stats['total_rollbacks']} rollbacks")
+        if self.controller is not None:
+            self.controller.close()
+            if self.verbose:
+                self.controller.summary()
+
 
 class YOLOCallback:
+    """Ultralytics has no hook between backward and the optimizer step, so
+    this callback detects failures after the step and rolls the weights back
+    to the last good checkpoint."""
 
     def __init__(
         self,
@@ -240,7 +245,7 @@ class YOLOCallback:
             self._heuristics = DetectionHeuristics(self._model, det_config, verbose=False)
 
             if self.verbose:
-                print(f"  ARC YOLO Callback: Protection enabled")
+                log("YOLO callback: protection enabled")
 
         self._initialized = True
 
@@ -264,7 +269,8 @@ class YOLOCallback:
                 if action.rolled_back:
                     self._rollback_count += 1
                     if self.verbose:
-                        print(f"  ARC: Rollback #{self._rollback_count} ({action.failure_type})")
+                        log(f"rollback #{self._rollback_count} ({action.failure_type})",
+                            logging.WARNING)
 
     def on_train_epoch_end(self, trainer):
         if self._rollback is not None:
@@ -273,7 +279,7 @@ class YOLOCallback:
     def on_train_end(self, trainer):
         if self.verbose and self._rollback is not None:
             stats = self._rollback.get_stats()
-            print(f"  ARC YOLO Summary: {stats['total_rollbacks']} rollbacks")
+            log(f"YOLO summary: {stats['total_rollbacks']} rollbacks")
 
     def wrap_trainer(self, trainer):
         if hasattr(trainer, 'add_callback'):
@@ -290,8 +296,6 @@ class YOLOCallback:
 
             trainer.on_train_batch_end = wrapped_batch_end
 
-        if self.verbose:
-            print(f"  ARC YOLO: Callbacks registered")
 
 class GenericTrainingWrapper:
     def __init__(
@@ -316,11 +320,8 @@ class GenericTrainingWrapper:
 
         self._heuristics = None
         if enable_heuristics:
-            try:
-                from arc.intervention.heuristics import AutoHeuristics
-                self._heuristics = AutoHeuristics(model, verbose=False)
-            except Exception:
-                pass
+            from arc.intervention.heuristics import AutoHeuristics
+            self._heuristics = AutoHeuristics(model, verbose=False)
 
         self.verbose = verbose
 
@@ -328,7 +329,7 @@ class GenericTrainingWrapper:
         action = self._rollback.step(loss)
 
         result = WrapperAction(
-            skip_step=action.rolled_back,
+            skip_step=action.should_skip,
             rolled_back=action.rolled_back,
             failure_type=action.failure_type,
         )
@@ -346,16 +347,14 @@ class GenericTrainingWrapper:
     def get_stats(self) -> Dict[str, Any]:
         return self._rollback.get_stats()
 
+
 @dataclass
 class WrapperAction:
     skip_step: bool
     rolled_back: bool
     failure_type: Optional[str] = None
-    warnings: list = None
+    warnings: list = dataclasses.field(default_factory=list)
 
-    def __post_init__(self):
-        if self.warnings is None:
-            self.warnings = []
 
 def get_callback(framework: str, **kwargs):
     framework = framework.lower()
@@ -368,33 +367,3 @@ def get_callback(framework: str, **kwargs):
         return YOLOCallback(**kwargs)
     else:
         raise ValueError(f"Unknown framework: {framework}. Use 'huggingface', 'lightning', or 'yolo'")
-
-if __name__ == "__main__":
-    print("Testing Framework Integrations...")
-
-    model = nn.Linear(10, 2)
-    optimizer = torch.optim.Adam(model.parameters())
-
-    wrapper = GenericTrainingWrapper(model, optimizer, verbose=True)
-
-    for i in range(10):
-        x = torch.randn(4, 10)
-        out = model(x)
-        loss = out.mean()
-        loss.backward()
-
-        action = wrapper.step(loss, out)
-        if action.skip_step:
-            print(f"Step {i}: Skipped due to rollback")
-            optimizer.zero_grad()
-            continue
-
-        optimizer.step()
-        optimizer.zero_grad()
-
-    print(f"  GenericTrainingWrapper test complete: {wrapper.get_stats()}")
-
-    print(f"\n  Available integrations:")
-    print(f"  - HuggingFace: {HF_AVAILABLE}")
-    print(f"  - PyTorch Lightning: {LIGHTNING_AVAILABLE}")
-    print(f"  - Ultralytics YOLO: Always available (lazy import)")

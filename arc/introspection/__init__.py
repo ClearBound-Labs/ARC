@@ -42,7 +42,8 @@ from arc.introspection.self_model import (
     MetaCognition,
 )
 from arc.introspection.arc_network import (
-    Arc,
+    IntrospectiveArc,
+    IntrospectionAction,
     create_self_aware_model,
     IntrospectionScheduler,
     SignalSmoother,
@@ -72,7 +73,8 @@ __all__ = [
     "TrainingDynamicsODE",
     "TrajectoryPredictor",
     "ContinuousLearningRateController",
-    "Arc",
+    "IntrospectiveArc",
+    "IntrospectionAction",
     "create_self_aware_model",
     "IntrospectionScheduler",
     "SignalSmoother",

@@ -700,9 +700,132 @@ class TestConformalPredictors:
 
 
 # =============================================================================
+# Issue #6 Regression Tests — Persistence & Configuration
+# =============================================================================
+
+class TestRollbackMaxCheckpoints:
+    """
+    Regression tests for Issue #6 Bug 1:
+    RollbackConfig.max_checkpoints was silently ignored because the deque
+    in RollbackState hardcoded maxlen=3.
+    """
+
+    def test_default_max_checkpoints(self, simple_model):
+        """Default config should use max_checkpoints=3."""
+        from arc.intervention import WeightRollback, RollbackConfig
+
+        config = RollbackConfig()
+        optimizer = torch.optim.Adam(simple_model.parameters())
+        rb = WeightRollback(simple_model, optimizer, config, verbose=False)
+
+        assert rb.state.checkpoints.maxlen == 3
+
+    def test_custom_max_checkpoints_honoured(self, simple_model):
+        """Setting max_checkpoints=5 must create a deque with maxlen=5."""
+        from arc.intervention import WeightRollback, RollbackConfig
+
+        config = RollbackConfig(max_checkpoints=5)
+        optimizer = torch.optim.Adam(simple_model.parameters())
+        rb = WeightRollback(simple_model, optimizer, config, verbose=False)
+
+        assert rb.state.checkpoints.maxlen == 5
+
+    def test_custom_max_checkpoints_retains_more(self, simple_model):
+        """With max_checkpoints=10, we should retain more than 3 checkpoints."""
+        from arc.intervention import WeightRollback, RollbackConfig
+
+        config = RollbackConfig(max_checkpoints=10, checkpoint_frequency=1)
+        optimizer = torch.optim.Adam(simple_model.parameters())
+        rb = WeightRollback(simple_model, optimizer, config, verbose=False)
+
+        # Run enough steps to save several checkpoints
+        for _ in range(20):
+            x = torch.randn(4, 100)
+            loss = simple_model(x).mean()
+            loss.backward()
+            rb.step(loss)
+            optimizer.step()
+            optimizer.zero_grad()
+
+        # With maxlen=10 we should have more than the old hardcoded 3
+        assert len(rb.state.checkpoints) > 3
+
+
+class TestArcV2EWCSaveLoad:
+    """
+    Regression tests for Issue #6 Bug 2:
+    ArcV2.save() computed ewc_state but never wrote it to disk.
+    No load() method existed.
+    """
+
+    def test_save_creates_ewc_state_file(self, simple_model, tmp_path):
+        """save() must write ewc_state.pt when EWC is active."""
+        from arc import ArcV2
+        import os
+
+        optimizer = torch.optim.Adam(simple_model.parameters())
+        arc = ArcV2(
+            continual_learning=True,
+            verbose=False,
+        )
+        arc.attach(simple_model, optimizer)
+
+        # Create a dummy dataloader for consolidation
+        dataset = torch.utils.data.TensorDataset(
+            torch.randn(20, 100), torch.randint(0, 10, (20,))
+        )
+        loader = torch.utils.data.DataLoader(dataset, batch_size=4)
+
+        arc.begin_task("task_1")
+        arc.consolidate_task(loader)
+        arc.save(str(tmp_path / "arc_ckpt"))
+
+        assert os.path.exists(tmp_path / "arc_ckpt" / "ewc_state.pt")
+        assert os.path.exists(tmp_path / "arc_ckpt" / "ewc_meta.json")
+
+    def test_load_restores_ewc_n_tasks(self, simple_model, tmp_path):
+        """load() must restore EWC task count from saved state."""
+        from arc import ArcV2
+
+        optimizer = torch.optim.Adam(simple_model.parameters())
+        arc = ArcV2(
+            continual_learning=True,
+            verbose=False,
+        )
+        arc.attach(simple_model, optimizer)
+
+        dataset = torch.utils.data.TensorDataset(
+            torch.randn(20, 100), torch.randint(0, 10, (20,))
+        )
+        loader = torch.utils.data.DataLoader(dataset, batch_size=4)
+
+        arc.begin_task("task_1")
+        arc.consolidate_task(loader)
+        assert arc._ewc.n_tasks == 1
+
+        save_path = str(tmp_path / "arc_ckpt")
+        arc.save(save_path)
+
+        # Create a fresh ArcV2 and restore
+        model2 = nn.Sequential(
+            nn.Linear(100, 50), nn.ReLU(), nn.Linear(50, 10),
+        )
+        optimizer2 = torch.optim.Adam(model2.parameters())
+        arc2 = ArcV2(
+            continual_learning=True,
+            verbose=False,
+        )
+        arc2.attach(model2, optimizer2)
+        arc2.load(save_path, model=model2)
+
+        assert arc2._ewc is not None
+        assert arc2._ewc.n_tasks == 1
+
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 
 if __name__ == "__main__":
     # Run with pytest
-    pytest.main([__file__, "-v", "--tb=short"])
+    pytest.main([__file__, "-v", "--tb=short"])

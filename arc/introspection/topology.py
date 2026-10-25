@@ -19,6 +19,7 @@
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass
 import math
+import warnings
 import numpy as np
 import torch
 import torch.nn as nn
@@ -72,34 +73,56 @@ class LossLandscapeSampler:
     ) -> Tuple[np.ndarray, np.ndarray]:
         directions = self._generate_directions()
 
-        radii = np.linspace(0, self.radius, 5)
-        coordinates = []
-        losses = []
-
         original_params = {
             name: param.data.clone()
             for name, param in self.model.named_parameters()
         }
 
+        coordinates = []
+        losses = []
+
         try:
-            for direction in directions[:self.n_directions]:
-                for r in radii:
-                    with torch.no_grad():
-                        for name, param in self.model.named_parameters():
-                            if name in direction:
-                                param.data = original_params[name] + r * direction[name]
+            if len(directions) >= 2:
+                # Genuine 2D loss-landscape scan: pair up directions and move
+                # along a (x, y) grid spanned by each pair, so the resulting
+                # coordinates actually vary in both dimensions instead of
+                # every sample collapsing onto y=0 regardless of direction.
+                grid = np.linspace(-self.radius, self.radius, 5)
+                pairs = list(zip(directions[0::2], directions[1::2]))
 
-                    with torch.no_grad():
-                        output = self.model(inputs)
-                        loss = loss_fn(output, targets).item()
+                for d1, d2 in pairs:
+                    for x in grid:
+                        for y in grid:
+                            with torch.no_grad():
+                                for name, param in self.model.named_parameters():
+                                    if name in d1:
+                                        param.data = (
+                                            original_params[name]
+                                            + x * d1[name]
+                                            + y * d2[name]
+                                        )
 
-                    if len(directions) >= 2:
-                        coord = [r, 0]
-                    else:
-                        coord = [r]
+                            with torch.no_grad():
+                                output = self.model(inputs)
+                                loss = loss_fn(output, targets).item()
 
-                    coordinates.append(coord)
-                    losses.append(loss)
+                            coordinates.append([x, y])
+                            losses.append(loss)
+            else:
+                radii = np.linspace(0, self.radius, 5)
+                for direction in directions[:self.n_directions]:
+                    for r in radii:
+                        with torch.no_grad():
+                            for name, param in self.model.named_parameters():
+                                if name in direction:
+                                    param.data = original_params[name] + r * direction[name]
+
+                        with torch.no_grad():
+                            output = self.model(inputs)
+                            loss = loss_fn(output, targets).item()
+
+                        coordinates.append([r])
+                        losses.append(loss)
         finally:
             with torch.no_grad():
                 for name, param in self.model.named_parameters():
@@ -131,6 +154,14 @@ class LossLandscapeSampler:
 class PersistentHomology:
     def __init__(self, max_dimension: int = 2):
         self.max_dimension = max_dimension
+        if max_dimension > 0:
+            warnings.warn(
+                "PersistentHomology only computes dimension-0 persistence "
+                "(connected components via union-find); higher-dimensional "
+                f"features (dimension 1..{max_dimension}) are not implemented, "
+                "so betti_1/betti_2 in TopologicalState will always be 0.",
+                stacklevel=2,
+            )
 
     def compute(
         self,
@@ -165,12 +196,6 @@ class PersistentHomology:
         birth_times = {i: sorted_values[i] for i in range(n_points)}
         if len(points.shape) == 1:
             points = points.reshape(-1, 1)
-
-        distances = np.zeros((n_points, n_points))
-        for i in range(n_points):
-            for j in range(i + 1, n_points):
-                d = np.linalg.norm(points[order[i]] - points[order[j]])
-                distances[i, j] = distances[j, i] = d
 
         edges = []
         for i in range(n_points):

@@ -16,180 +16,51 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with ARC. If not, see <https://www.gnu.org/licenses/>.
 
+"""Mixed-precision rollback, built on `arc.Controller`.
+
+Call order per step (the Controller unscales the gradients itself, so don't
+call ``scaler.unscale_()``):
+
+    scaler.scale(loss).backward()
+    action = amp_rollback.step(loss)
+    if not action.should_skip:
+        scaler.step(optimizer)
+        scaler.update()
+
+Gradients are judged at their true scale. A GradScaler overflow is routine
+fp16 behaviour (the scaler skips that step and lowers its scale), not a
+failure, so it never triggers a rollback.
+"""
+
+import warnings
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
 import torch
 import torch.nn as nn
-from typing import Optional, Dict, Any, Union
-from dataclasses import dataclass, field
-import warnings
 
-try:
-    from torch.cuda.amp import GradScaler, autocast
-    AMP_AVAILABLE = True
-except ImportError:
-    AMP_AVAILABLE = False
+from arc.core.controller import Controller, ControllerConfig, HealthStatus, StepAction
+
+AMP_AVAILABLE = True  # torch.amp ships with every supported PyTorch
+
 
 @dataclass
 class AMPConfig:
     dtype: str = "fp16"
     use_autocast: bool = True
 
+    # fp16 weights within 10% of this magnitude count as an overflow.
     detect_overflow: bool = True
     overflow_threshold: float = 65504.0
     bf16_overflow_threshold: float = 3.4e38
 
     coordinate_scaler: bool = True
     min_scale: float = 1.0
-    scale_growth_interval: int = 2000
 
     rollback_on_overflow: bool = True
     reduce_scale_on_rollback: bool = True
     scale_reduction_factor: float = 0.5
 
-class AMPRollback:
-    def __init__(
-        self,
-        model: nn.Module,
-        optimizer: torch.optim.Optimizer,
-        scaler: Optional['GradScaler'] = None,
-        config: Optional[AMPConfig] = None,
-        verbose: bool = True,
-    ):
-        from arc.intervention.rollback import WeightRollback, RollbackConfig
-
-        self.model = model
-        self.optimizer = optimizer
-        self.scaler = scaler
-        self.config = config or AMPConfig()
-        self.verbose = verbose
-
-        if self.config.dtype == "bf16":
-            self._overflow_threshold = self.config.bf16_overflow_threshold
-        else:
-            self._overflow_threshold = self.config.overflow_threshold
-
-        rollback_config = RollbackConfig(
-            fast_grad_norm=True,
-            skip_stable_layers=True,
-        )
-        self._rollback = WeightRollback(model, optimizer, rollback_config, verbose=False)
-
-        self._scale_history = []
-        self._overflow_count = 0
-
-        if verbose:
-            print(f"⚡ AMPRollback initialized (dtype={self.config.dtype})")
-
-    def _detect_overflow(self, loss: torch.Tensor) -> Dict[str, Any]:
-        result = {
-            'overflow': False,
-            'type': None,
-            'details': {},
-        }
-
-        if isinstance(loss, torch.Tensor):
-            loss_val = loss.item() if loss.numel() == 1 else loss.max().item()
-
-            if loss_val > self._overflow_threshold:
-                result['overflow'] = True
-                result['type'] = 'loss_overflow'
-                result['details']['loss'] = loss_val
-                result['details']['threshold'] = self._overflow_threshold
-                return result
-
-        for name, p in self.model.named_parameters():
-            if p.dtype in [torch.float16, torch.bfloat16]:
-                if p.abs().max().item() > self._overflow_threshold * 0.9:
-                    result['overflow'] = True
-                    result['type'] = 'weight_near_overflow'
-                    result['details']['layer'] = name
-                    result['details']['max_val'] = p.abs().max().item()
-                    return result
-
-        for p in self.model.parameters():
-            if p.grad is not None:
-                grad_max = p.grad.abs().max().item()
-                if grad_max > self._overflow_threshold * 0.9:
-                    result['overflow'] = True
-                    result['type'] = 'gradient_near_overflow'
-                    result['details']['max_grad'] = grad_max
-                    return result
-
-        return result
-
-    def _handle_scaler_overflow(self) -> bool:
-        if self.scaler is None or not self.config.coordinate_scaler:
-            return False
-
-        scale = self.scaler.get_scale()
-        self._scale_history.append(scale)
-
-        if len(self._scale_history) >= 2:
-            if self._scale_history[-1] < self._scale_history[-2]:
-                self._overflow_count += 1
-                if self.verbose:
-                    print(f"  GradScaler overflow detected (scale: {scale:.2f})")
-                return True
-
-        if scale < self.config.min_scale:
-            self.scaler.update(self.config.min_scale)
-            if self.verbose:
-                print(f"  Restored GradScaler to min_scale ({self.config.min_scale})")
-
-        return False
-
-    def step(
-        self,
-        loss: torch.Tensor,
-        scaler: Optional['GradScaler'] = None,
-    ) -> 'AMPRollbackAction':
-        if scaler is not None:
-            self.scaler = scaler
-
-        overflow = self._detect_overflow(loss)
-        scaler_overflow = self._handle_scaler_overflow()
-
-        action = AMPRollbackAction(
-            step=self._rollback.state.step_count,
-            rolled_back=False,
-            overflow_detected=overflow['overflow'] or scaler_overflow,
-            overflow_type=overflow.get('type'),
-        )
-
-        if overflow['overflow'] and self.config.rollback_on_overflow:
-            rollback_action = self._rollback.step(torch.tensor(float('inf')))
-            action.rolled_back = rollback_action.rolled_back
-            action.steps_back = rollback_action.steps_back
-
-            if self.scaler is not None and self.config.reduce_scale_on_rollback:
-                current_scale = self.scaler.get_scale()
-                new_scale = current_scale * self.config.scale_reduction_factor
-                self.scaler.update(max(new_scale, self.config.min_scale))
-                action.new_scale = self.scaler.get_scale()
-
-            if self.verbose:
-                print(f"  AMP Rollback: {overflow.get('type', 'scaler_overflow')}")
-        else:
-            rollback_action = self._rollback.step(loss)
-            action.rolled_back = rollback_action.rolled_back
-            action.steps_back = rollback_action.steps_back
-
-        if self.scaler is not None:
-            action.current_scale = self.scaler.get_scale()
-
-        return action
-
-    def end_epoch(self):
-        self._rollback.end_epoch()
-        self._overflow_count = 0
-
-    def get_stats(self) -> Dict[str, Any]:
-        stats = self._rollback.get_stats()
-        stats.update({
-            'overflow_count': self._overflow_count,
-            'current_scale': self.scaler.get_scale() if self.scaler else None,
-            'dtype': self.config.dtype,
-        })
-        return stats
 
 @dataclass
 class AMPRollbackAction:
@@ -200,6 +71,97 @@ class AMPRollbackAction:
     steps_back: int = 0
     current_scale: Optional[float] = None
     new_scale: Optional[float] = None
+    should_skip: bool = False
+
+
+class AMPRollback:
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scaler: Optional[torch.amp.GradScaler] = None,
+        config: Optional[AMPConfig] = None,
+        verbose: bool = True,
+        controller_config: Optional[ControllerConfig] = None,
+    ):
+        self.model = model
+        self.optimizer = optimizer
+        self.scaler = scaler
+        self.config = config or AMPConfig()
+        self.verbose = verbose
+        self._overflow_threshold = (
+            self.config.bf16_overflow_threshold if self.config.dtype == "bf16"
+            else self.config.overflow_threshold
+        )
+        self._controller = Controller(
+            model, optimizer, scaler=scaler,
+            config=controller_config or ControllerConfig(
+                verbose=verbose, enable_lyapunov=False, enable_trend=False),
+        )
+        self._overflow_count = 0
+
+    def _weight_near_overflow(self) -> bool:
+        if not self.config.detect_overflow:
+            return False
+        limits = [
+            torch.linalg.vector_norm(p.detach(), float("inf")) > self._overflow_threshold * 0.9
+            for p in self.model.parameters()
+            if p.dtype in (torch.float16, torch.bfloat16)
+        ]
+        return bool(limits) and bool(torch.stack([x.to(limits[0].device) for x in limits]).any())
+
+    def step(
+        self,
+        loss: torch.Tensor,
+        scaler: Optional[torch.amp.GradScaler] = None,
+    ) -> AMPRollbackAction:
+        if scaler is not None and scaler is not self._controller.scaler:
+            self.scaler = scaler
+            self._controller.scaler = scaler
+
+        if self.config.rollback_on_overflow and self._weight_near_overflow():
+            self._controller._step_count += 1
+            action = self._controller._handle_failure(
+                StepAction(step=self._controller._step_count), "weight_near_overflow")
+        else:
+            action = self._controller.step(loss)
+
+        fp16_overflow = action.status == HealthStatus.WARNING and "overflow" in action.message
+        if fp16_overflow:
+            self._overflow_count += 1
+
+        result = AMPRollbackAction(
+            step=action.step,
+            rolled_back=action.rolled_back,
+            overflow_detected=fp16_overflow or action.failure_type == "weight_near_overflow",
+            overflow_type=action.failure_type or ("gradient_overflow" if fp16_overflow else None),
+            should_skip=action.should_skip,
+        )
+
+        if self.scaler is not None and self.scaler.is_enabled():
+            if action.rolled_back and self.config.reduce_scale_on_rollback:
+                new_scale = max(self.scaler.get_scale() * self.config.scale_reduction_factor,
+                                self.config.min_scale)
+                self.scaler.update(new_scale)
+                result.new_scale = new_scale
+            elif self.config.coordinate_scaler and self.scaler.get_scale() < self.config.min_scale:
+                self.scaler.update(self.config.min_scale)
+            result.current_scale = self.scaler.get_scale()
+
+        return result
+
+    def end_epoch(self):
+        self._overflow_count = 0
+
+    def get_stats(self) -> Dict[str, Any]:
+        stats = self._controller.get_stats()
+        stats.update({
+            'overflow_count': self._overflow_count,
+            'current_scale': self.scaler.get_scale() if self.scaler else None,
+            'dtype': self.config.dtype,
+        })
+        return stats
+
 
 class SafeAutocast:
 
@@ -212,7 +174,7 @@ class SafeAutocast:
     ):
         self.amp_rollback = amp_rollback
         self.device_type = device_type
-        self.enabled = enabled and AMP_AVAILABLE
+        self.enabled = enabled
 
         if dtype is None:
             if amp_rollback and amp_rollback.config.dtype == "bf16":
@@ -224,10 +186,7 @@ class SafeAutocast:
 
     def __enter__(self):
         if self.enabled:
-            self._autocast = torch.autocast(
-                device_type=self.device_type,
-                dtype=self.dtype,
-            )
+            self._autocast = torch.autocast(device_type=self.device_type, dtype=self.dtype)
             return self._autocast.__enter__()
         return self
 
@@ -235,33 +194,19 @@ class SafeAutocast:
         if self.enabled:
             return self._autocast.__exit__(*args)
         return False
+
+
 def create_amp_training(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     dtype: str = "fp16",
     device: str = "cuda",
 ) -> tuple:
-
-    if not AMP_AVAILABLE:
-        warnings.warn("AMP not available, using FP32")
+    if device == "cuda" and not torch.cuda.is_available():
+        warnings.warn("CUDA not available, AMP disabled; training in fp32")
         return model, None, None
 
-    scaler = GradScaler()
-
-    config = AMPConfig(dtype=dtype)
-
-    amp_rollback = AMPRollback(model, optimizer, scaler, config)
-
+    # bf16 has fp32's exponent range and needs no loss scaling.
+    scaler = torch.amp.GradScaler(device, enabled=(dtype == "fp16"))
+    amp_rollback = AMPRollback(model, optimizer, scaler, AMPConfig(dtype=dtype))
     return model, scaler, amp_rollback
-
-if __name__ == "__main__":
-    print("Testing AMPRollback...")
-
-    model = nn.Linear(10, 2).cuda() if torch.cuda.is_available() else nn.Linear(10, 2)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-
-    if AMP_AVAILABLE and torch.cuda.is_available():
-        model, scaler, rollback = create_amp_training(model, optimizer, "fp16")
-        print(f"  AMPRollback created: {rollback.get_stats()}")
-    else:
-        print("  AMP or CUDA not available, skipping test")

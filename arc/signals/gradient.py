@@ -18,6 +18,7 @@
 
 from typing import Dict, Any, Optional, List
 import math
+import warnings
 import torch
 import torch.nn as nn
 import numpy as np
@@ -39,32 +40,43 @@ class GradientCollector(SignalCollector):
         if self._model is None:
             return
 
+        # No backward hooks are registered.
+        #
+        # `register_full_backward_hook` raises on any module whose output is
+        # later modified in place — which includes every `nn.ReLU(inplace=True)`,
+        # and therefore torchvision's ResNet, VGG and MobileNet as shipped:
+        #
+        #   RuntimeError: Output 0 of BackwardHookFunctionBackward is a view
+        #   and is being modified inplace.
+        #
+        # A monitoring collector must never be able to break the run it is
+        # observing. The hook was only ever used to copy `param.grad` into
+        # `_gradient_data`, and those gradients are still sitting on the
+        # parameters after `backward()` returns, so they can simply be read at
+        # collect time. Same numbers, no interference, and one less set of
+        # autograd callbacks per step.
         layer_idx = 0
         for name, module in self._model.named_modules():
-
             if list(module.parameters(recurse=False)):
                 self._layer_names.append(name or "root")
                 self._layer_order[name or "root"] = layer_idx
                 layer_idx += 1
 
-                hook = module.register_full_backward_hook(
-                    self._make_backward_hook(name or "root")
-                )
-                self._hooks.append(hook)
-
-    def _make_backward_hook(self, layer_name: str):
-
-        def hook(module, grad_input, grad_output):
-
-            grads = []
-            for param in module.parameters(recurse=False):
-                if param.grad is not None:
-                    grads.append(param.grad.detach().flatten())
-
+    def _snapshot_gradients(self) -> None:
+        """Read the current `param.grad` of every parameterised module."""
+        if self._model is None:
+            return
+        for name, module in self._model.named_modules():
+            layer_name = name or "root"
+            if layer_name not in self._layer_order:
+                continue
+            grads = [
+                param.grad.detach().flatten()
+                for param in module.parameters(recurse=False)
+                if param.grad is not None
+            ]
             if grads:
                 self._gradient_data[layer_name] = torch.cat(grads)
-
-        return hook
 
     def _collect_signals(self) -> Dict[str, Any]:
 
@@ -72,6 +84,8 @@ class GradientCollector(SignalCollector):
             "layer_stats": {},
             "global": {},
         }
+
+        self._snapshot_gradients()
 
         if not self._gradient_data:
             return signals
@@ -157,7 +171,8 @@ class GradientCollector(SignalCollector):
 
             return normalized_entropy
 
-        except Exception:
+        except Exception as e:
+            warnings.warn(f"Gradient entropy computation failed: {e}")
             return 0.0
 
     def _get_metadata(self) -> Dict[str, Any]:

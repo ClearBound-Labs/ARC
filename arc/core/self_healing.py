@@ -24,6 +24,8 @@ from collections import deque
 import copy
 import time
 import math
+import warnings
+from arc._logging import log as _log
 
 @dataclass
 class SelfHealingConfig:
@@ -39,7 +41,8 @@ class SelfHealingConfig:
     lr_reduction_factor: float = 0.1
     max_lr_reductions: int = 5
     gradient_clip_norm: float = 1.0
-    enable_baseline_clipping: bool = True
+    # Opt-in: clipping changes the optimisation itself.
+    enable_baseline_clipping: bool = False
 
     enable_forecasting: bool = True
     forecast_window: int = 10
@@ -86,6 +89,11 @@ class SelfHealingArc:
         optimizer: torch.optim.Optimizer,
         config: Optional[SelfHealingConfig] = None,
     ):
+        warnings.warn(
+            "SelfHealingArc is a legacy API kept for compatibility; use arc.Controller, "
+            "which covers everything it does (plus GradScaler, DDP and honest recovery stats).",
+            FutureWarning, stacklevel=2,
+        )
         self.model = model
         self.optimizer = optimizer
         self.config = config or SelfHealingConfig()
@@ -95,6 +103,9 @@ class SelfHealingArc:
         self.current_lr = self._get_lr()
         self.original_lr = self.current_lr
         self.lr_reductions = 0
+        # Cumulative LR reduction, re-applied after every checkpoint restore
+        # (load_state_dict would otherwise resurrect the pre-reduction lr).
+        self._lr_penalty = 1.0
 
         self.checkpoints: List[Tuple[int, dict, dict]] = []
         self._save_checkpoint()
@@ -125,7 +136,7 @@ class SelfHealingArc:
 
         if self.config.verbose:
             n_params = sum(p.numel() for _, p in self._param_list)
-            print(f"    SelfHealingArc initialized: {n_params/1e6:.2f}M params")
+            _log(f"    SelfHealingArc initialized: {n_params/1e6:.2f}M params")
 
     def _get_lr(self) -> float:
         for pg in self.optimizer.param_groups:
@@ -152,20 +163,22 @@ class SelfHealingArc:
             model_state = copy.deepcopy(self.model.state_dict())
             opt_state = copy.deepcopy(self.optimizer.state_dict())
 
-        self.checkpoints.append((self.step_count, model_state, opt_state))
+        self.checkpoints.append((self.step_count, model_state, opt_state, self._lr_penalty))
 
     def _restore_checkpoint(self, index: int = -1) -> bool:
         if not self.checkpoints:
             return False
 
         try:
-            step, model_state, opt_state = self.checkpoints[index]
+            step, model_state, opt_state, penalty_at_save = self.checkpoints[index]
 
             device = next(self.model.parameters()).device
 
+            # Always a copy: Optimizer.load_state_dict keeps same-device tensors
+            # as-is, so training would otherwise mutate the stored checkpoint.
+            opt_state = copy.deepcopy(opt_state)
             if self.config.cpu_offload:
                 model_state = {k: v.to(device) for k, v in model_state.items()}
-                opt_state = copy.deepcopy(opt_state)
                 for state in opt_state.get('state', {}).values():
                     for k, v in state.items():
                         if isinstance(v, torch.Tensor):
@@ -174,13 +187,18 @@ class SelfHealingArc:
             self.model.load_state_dict(model_state)
             self.optimizer.load_state_dict(opt_state)
 
+            # The restored param_groups carry the LR in force at save time;
+            # re-apply only the reductions made since then.
+            ratio = self._lr_penalty / penalty_at_save
+            self._set_lr(self._get_lr() * ratio)
+
             if self.config.verbose:
-                print(f"      Rolled back to step {step}")
+                _log(f"      Rolled back to step {step}")
 
             return True
         except Exception as e:
             if self.config.verbose:
-                print(f"      Rollback failed: {e}")
+                _log(f"      Rollback failed: {e}")
             return False
 
     def _compute_gradient_norm(self) -> float:
@@ -263,9 +281,10 @@ class SelfHealingArc:
             new_lr = self.current_lr * self.config.lr_reduction_factor
             self._set_lr(new_lr)
             self.lr_reductions += 1
+            self._lr_penalty *= self.config.lr_reduction_factor
 
             if self.config.verbose:
-                print(f"      LR reduced to {new_lr:.2e}")
+                _log(f"      LR reduced to {new_lr:.2e}")
 
     def _track_rollback(self) -> bool:
         """Track consecutive rollbacks and detect persistent failure loop.
@@ -318,7 +337,7 @@ class SelfHealingArc:
         self._baseline_weight_stats = self._compute_weight_stats()
         
         if self.config.verbose:
-            print(f"      ⚡ PERSISTENT FAILURE ESCAPE: Skip to step {self._skip_until_step}, weights perturbed")
+            _log(f"      ⚡ PERSISTENT FAILURE ESCAPE: Skip to step {self._skip_until_step}, weights perturbed")
         
         return True
     
@@ -329,7 +348,7 @@ class SelfHealingArc:
         with torch.no_grad():
             for _, p in self._param_list:
                 # Add scaled random noise
-                noise = torch.randn_like(p) * scale * p.abs().mean()
+                noise = torch.randn_like(p) * scale * (p.abs().mean() + 1e-8)
                 p.add_(noise)
     
     def _should_skip_step(self) -> bool:
@@ -345,7 +364,7 @@ class SelfHealingArc:
                 "timestamp": datetime.datetime.now().isoformat(),
                 "step": self.step_count,
                 "reason": reason,
-                "loss_value": loss_val if not (loss_val != loss_val) else "NaN",
+                "loss_value": "NaN" if math.isnan(loss_val) else loss_val,
                 "action": action,
                 "new_lr": self.current_lr,
                 "stability_score": self._stability_score,
@@ -376,6 +395,32 @@ class SelfHealingArc:
                     self._stability_score * (self.config.max_checkpoint_frequency - self.config.min_checkpoint_frequency)
                 )
 
+    def _handle_failure(self, action: HealingAction, failure_type: str, action_config: str = "rollback") -> HealingAction:
+        """Unified failure handling: detect -> rollback -> heal.
+
+        Mirrors Controller._handle_failure. Replaces four copy-pasted
+        rollback/lr-reduce/track/escape blocks that previously only the
+        nan_loss branch gated on config (loss_nan_action); nan_weights now
+        consistently respects the (previously unused) weight_nan_action.
+        """
+        action.failure_detected = failure_type
+        action.should_skip = True
+        self.failures_detected += 1
+
+        if action_config == "rollback":
+            if self._restore_checkpoint():
+                action.rolled_back = True
+                self.total_rollbacks += 1
+                self.failures_recovered += 1
+                self._reduce_lr()
+                action.lr_reduced = True
+
+                if self._track_rollback():
+                    self._escape_persistent_failure()
+                    action.message = "Persistent failure detected, escaping"
+
+        return action
+
     def step(self, loss: torch.Tensor) -> HealingAction:
         self.step_count += 1
 
@@ -393,25 +438,10 @@ class SelfHealingArc:
             return action
 
         if torch.isnan(loss) or torch.isinf(loss):
-            action.failure_detected = "nan_loss"
-            action.should_skip = True
-            self.failures_detected += 1
-
-            if self.config.loss_nan_action == "rollback":
-                if self._restore_checkpoint():
-                    action.rolled_back = True
-                    self.total_rollbacks += 1
-                    self.failures_recovered += 1
-                    self._reduce_lr()
-                    action.lr_reduced = True
-                    
-                    # Check for persistent failure loop
-                    if self._track_rollback():
-                        self._escape_persistent_failure()
-                        action.message = "Persistent failure detected, escaping"
+            self._handle_failure(action, "nan_loss", self.config.loss_nan_action)
 
             if self.config.verbose:
-                print(f"      NaN/Inf loss detected at step {self.step_count}")
+                _log(f"      NaN/Inf loss detected at step {self.step_count}")
 
             return action
 
@@ -420,24 +450,10 @@ class SelfHealingArc:
 
         if loss_val > self.config.loss_explosion_threshold:
             if self.loss_history and loss_val > self.loss_history[-1] * 10:
-                action.failure_detected = "loss_explosion"
-                action.should_skip = True
-                self.failures_detected += 1
-
-                if self._restore_checkpoint():
-                    action.rolled_back = True
-                    self.total_rollbacks += 1
-                    self.failures_recovered += 1
-                    self._reduce_lr()
-                    action.lr_reduced = True
-                    
-                    # Check for persistent failure loop
-                    if self._track_rollback():
-                        self._escape_persistent_failure()
-                        action.message = "Persistent failure detected, escaping"
+                self._handle_failure(action, "loss_explosion")
 
                 if self.config.verbose:
-                    print(f"      Loss explosion detected: {loss_val:.2f}")
+                    _log(f"      Loss explosion detected: {loss_val:.2f}")
 
                 return action
 
@@ -447,24 +463,10 @@ class SelfHealingArc:
                 should_check_weights = False
 
         if should_check_weights and self._check_weights_for_nan():
-            action.failure_detected = "nan_weights"
-            action.should_skip = True
-            self.failures_detected += 1
-
-            if self._restore_checkpoint():
-                action.rolled_back = True
-                self.total_rollbacks += 1
-                self.failures_recovered += 1
-                self._reduce_lr()
-                action.lr_reduced = True
-                
-                # Check for persistent failure loop
-                if self._track_rollback():
-                    self._escape_persistent_failure()
-                    action.message = "Persistent failure detected, escaping"
+            self._handle_failure(action, "nan_weights", self.config.weight_nan_action)
 
             if self.config.verbose:
-                print(f"      NaN weights detected at step {self.step_count}")
+                _log(f"      NaN weights detected at step {self.step_count}")
 
             return action
 
@@ -473,24 +475,10 @@ class SelfHealingArc:
             if self.step_count % self.config.weight_health_check_frequency == 0:
                 is_corrupted, corruption_type = self._check_weight_health()
                 if is_corrupted:
-                    action.failure_detected = corruption_type
-                    action.should_skip = True
-                    self.failures_detected += 1
-
-                    if self._restore_checkpoint():
-                        action.rolled_back = True
-                        self.total_rollbacks += 1
-                        self.failures_recovered += 1
-                        self._reduce_lr()
-                        action.lr_reduced = True
-                        
-                        # Check for persistent failure loop
-                        if self._track_rollback():
-                            self._escape_persistent_failure()
-                            action.message = "Persistent failure detected, escaping"
+                    self._handle_failure(action, corruption_type)
 
                     if self.config.verbose:
-                        print(f"      Silent weight corruption detected: {corruption_type}")
+                        _log(f"      Silent weight corruption detected: {corruption_type}")
 
                     return action
 
@@ -518,7 +506,7 @@ class SelfHealingArc:
                 action.lr_reduced = True
 
             if self.config.verbose:
-                print(f"      NaN gradients detected")
+                _log(f"      NaN gradients detected")
 
             return action
         grad_norm = self._compute_gradient_norm()
@@ -534,7 +522,7 @@ class SelfHealingArc:
             action.gradients_clipped = True
 
             if self.config.verbose:
-                print(f"    ✂️ Gradient explosion clipped: {grad_norm:.2e}")
+                _log(f"    ✂️ Gradient explosion clipped: {grad_norm:.2e}")
 
         if self.config.enable_forecasting:
             will_explode, growth = self._predict_explosion()

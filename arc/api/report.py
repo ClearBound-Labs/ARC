@@ -35,7 +35,7 @@ class ReportGenerator:
         lines = []
 
         lines.append("╔" + "═" * (width - 2) + "╗")
-        title = f"NEURAL PROPHET - Epoch {prediction.epoch}"
+        title = f"ARC FAILURE PREDICTION - Epoch {prediction.epoch}"
         lines.append("║" + title.center(width - 2) + "║")
         lines.append("╠" + "═" * (width - 2) + "╣")
 

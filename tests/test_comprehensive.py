@@ -30,8 +30,8 @@ sys.path.insert(0, '.')
 
 from arc.intervention import WeightRollback, RollbackConfig
 
-# Simple model
-class TestModel(nn.Module):
+# Simple model (underscore prefix prevents pytest from collecting it as a test class)
+class _ComprehensiveTestModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
@@ -46,7 +46,7 @@ class TestModel(nn.Module):
 def test_rng_preservation():
     """Test 1: RNG State Preservation"""
     print('\n[1] RNG STATE PRESERVATION TEST')
-    model = TestModel()
+    model = _ComprehensiveTestModel()
     opt = torch.optim.Adam(model.parameters(), lr=0.01)
     config = RollbackConfig(checkpoint_frequency=10)
     rb = WeightRollback(model, opt, config, verbose=False)
@@ -56,7 +56,7 @@ def test_rng_preservation():
     print(f'  RNG state in checkpoint: {has_rng}')
     print(f'  Torch RNG saved: {rb.state.checkpoints[0]["rng_state"]["torch"] is not None}')
     assert has_rng
-    return has_rng
+
 
 
 def test_failure_detection():
@@ -70,7 +70,7 @@ def test_failure_detection():
 
     results = []
     for name, loss_val in test_cases:
-        model = TestModel()
+        model = _ComprehensiveTestModel()
         opt = torch.optim.Adam(model.parameters(), lr=0.01)
         rb = WeightRollback(model, opt, RollbackConfig(), verbose=False)
         
@@ -94,7 +94,7 @@ def test_failure_detection():
         results.append(action.rolled_back)
     
     assert all(results)
-    return all(results)
+
 
 
 def test_recovery_success():
@@ -103,7 +103,7 @@ def test_recovery_success():
     success_count = 0
     for seed in range(10):
         torch.manual_seed(seed)
-        model = TestModel()
+        model = _ComprehensiveTestModel()
         opt = torch.optim.Adam(model.parameters(), lr=0.01)
         rb = WeightRollback(model, opt, RollbackConfig(checkpoint_frequency=5), verbose=False)
         
@@ -134,13 +134,13 @@ def test_recovery_success():
 
     print(f'  Recovery rate: {success_count}/10 ({success_count*10}%)')
     assert success_count == 10
-    return success_count == 10
+
 
 
 def test_false_positives():
     """Test 4: False Positive Check"""
     print('\n[4] FALSE POSITIVE TEST (1000 stable steps)')
-    model = TestModel()
+    model = _ComprehensiveTestModel()
     opt = torch.optim.Adam(model.parameters(), lr=0.001)
     rb = WeightRollback(model, opt, RollbackConfig(), verbose=False)
 
@@ -157,13 +157,13 @@ def test_false_positives():
 
     print(f'  False positives: {false_positives}/1000 ({false_positives/10}%)')
     assert false_positives == 0
-    return false_positives == 0
+
 
 
 def test_lr_reduction():
     """Test 5: LR Reduction After Rollback"""
     print('\n[5] LR REDUCTION AFTER ROLLBACK')
-    model = TestModel()
+    model = _ComprehensiveTestModel()
     opt = torch.optim.Adam(model.parameters(), lr=0.1)
     rb = WeightRollback(model, opt, RollbackConfig(lr_reduction_factor=0.5), verbose=False)
 
@@ -184,13 +184,13 @@ def test_lr_reduction():
     correct = abs(new_lr - initial_lr * 0.5) < 1e-6
     print(f'  Reduction correct: {correct}')
     assert correct
-    return correct
+
 
 
 def test_optimizer_state():
     """Test 6: Optimizer State Preservation"""
     print('\n[6] OPTIMIZER STATE PRESERVATION')
-    model = TestModel()
+    model = _ComprehensiveTestModel()
     opt = torch.optim.Adam(model.parameters(), lr=0.01)
     rb = WeightRollback(model, opt, RollbackConfig(checkpoint_frequency=5), verbose=False)
 
@@ -209,13 +209,13 @@ def test_optimizer_state():
     print(f'  Optimizer has state (m,v): {has_state}')
     print(f'  Checkpoint saves optimizer: {saves_optimizer}')
     assert has_state and saves_optimizer
-    return has_state and saves_optimizer
+
 
 
 def test_multi_failure():
     """Test 7: Multiple Consecutive Failures"""
     print('\n[7] MULTIPLE FAILURE RECOVERY')
-    model = TestModel()
+    model = _ComprehensiveTestModel()
     opt = torch.optim.Adam(model.parameters(), lr=0.01)
     rb = WeightRollback(model, opt, RollbackConfig(checkpoint_frequency=10, max_rollbacks_per_epoch=5), verbose=False)
 
@@ -244,13 +244,13 @@ def test_multi_failure():
     print(f'  Rollbacks triggered: {rollback_count}')
     print(f'  Training completed: True')
     assert rollback_count >= 3
-    return rollback_count >= 3
+
 
 
 def test_gradient_explosion():
     """Test 8: Gradient Explosion Detection"""
     print('\n[8] GRADIENT EXPLOSION DETECTION')
-    model = TestModel()
+    model = _ComprehensiveTestModel()
     opt = torch.optim.Adam(model.parameters(), lr=0.01)
     config = RollbackConfig(gradient_explosion_threshold=1e4)
     rb = WeightRollback(model, opt, config, verbose=False)
@@ -271,7 +271,7 @@ def test_gradient_explosion():
     
     print(f'  Gradient explosion detected: {action.rolled_back}')
     assert action.rolled_back
-    return action.rolled_back
+
 
 
 if __name__ == '__main__':
@@ -293,8 +293,10 @@ if __name__ == '__main__':
     results = []
     for name, test_fn in tests:
         try:
-            passed = test_fn()
-            results.append((name, 'PASS' if passed else 'FAIL'))
+            test_fn()
+            results.append((name, 'PASS'))
+        except AssertionError as e:
+            results.append((name, f'FAIL: {e}'))
         except Exception as e:
             results.append((name, f'ERROR: {e}'))
 
@@ -302,9 +304,9 @@ if __name__ == '__main__':
     print('TEST RESULTS SUMMARY')
     print('='*60)
     for name, status in results:
-        symbol = '✓' if status == 'PASS' else '✗'
+        symbol = '\u2713' if status == 'PASS' else '\u2717'
         print(f'  {symbol} {name}: {status}')
     
     passed = sum(1 for _, s in results if s == 'PASS')
     print(f'\nTotal: {passed}/{len(tests)} tests passed')
-    print('='*60)
+    print('='*60)

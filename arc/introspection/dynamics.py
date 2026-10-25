@@ -254,7 +254,7 @@ class PhaseSpaceAnalyzer:
         self.lyapunov = lyapunov
         self.attractor = attractor
 
-        self._phase_history: List[Tuple[float, float]] = []
+        self._phase_history: deque = deque(maxlen=200)
 
     def update(self) -> DynamicalState:
         lyap = self.lyapunov.update()
@@ -289,7 +289,7 @@ class PhaseSpaceAnalyzer:
         if len(self._phase_history) < 10:
             return False
 
-        recent = self._phase_history[-10:]
+        recent = list(self._phase_history)[-10:]
         accelerations = [a for v, a in recent]
 
         if len(accelerations) >= 5:

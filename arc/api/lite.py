@@ -22,6 +22,8 @@ from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 import random
 import time
+import math
+import warnings
 
 @dataclass
 class LiteConfig:
@@ -46,6 +48,11 @@ class LiteArc:
         optimizer: Optional[torch.optim.Optimizer] = None,
         config: Optional[LiteConfig] = None,
     ):
+        warnings.warn(
+            "LiteArc is a legacy API kept for compatibility; it only raises alerts. "
+            "Use arc.Controller, which detects and recovers at under 1% overhead.",
+            FutureWarning, stacklevel=2,
+        )
         self.model = model
         self.optimizer = optimizer
         self.config = config or LiteConfig()
@@ -57,6 +64,7 @@ class LiteArc:
         self.step_count = 0
         self.epoch_count = 0
         self.alerts = []
+        self._last_epoch_end_step = 0
 
         self.total_check_time = 0.0
         self.checks_performed = 0
@@ -73,7 +81,7 @@ class LiteArc:
         if self.config.check_loss:
             loss_val = loss.item() if isinstance(loss, torch.Tensor) else loss
 
-            if loss_val != loss_val:
+            if math.isnan(loss_val):
                 result["alert"] = "nan_loss"
                 result["recommendation"] = "rollback"
                 self._record_alert(result)
@@ -136,9 +144,17 @@ class LiteArc:
     def end_epoch(self, epoch: int) -> Dict[str, Any]:
         self.epoch_count = epoch
 
+        # Count alerts since the last epoch boundary by actual step count,
+        # not a hardcoded steps-per-epoch guess (which was wrong for any
+        # dataset/batch-size combo that isn't exactly 1000 steps/epoch).
+        alerts_this_epoch = len(
+            [a for a in self.alerts if a["step"] > self._last_epoch_end_step]
+        )
+        self._last_epoch_end_step = self.step_count
+
         return {
             "epoch": epoch,
-            "alerts_this_epoch": len([a for a in self.alerts if a["step"] > (epoch - 1) * 1000]),
+            "alerts_this_epoch": alerts_this_epoch,
             "avg_check_time_ms": (self.total_check_time / max(self.checks_performed, 1)) * 1000,
         }
 
@@ -154,9 +170,14 @@ class LiteArc:
 
     @classmethod
     def from_standard(cls, arc_instance) -> "LiteArc":
+        """Downgrade a standard ARC instance (Controller, SelfHealingArc) to LiteArc.
+
+        Expects `arc_instance` to expose `.model`/`.optimizer` directly, as
+        Controller and SelfHealingArc both do.
+        """
         return cls(
-            model=arc_instance.arc.model,
-            optimizer=arc_instance.arc.optimizer,
+            model=arc_instance.model,
+            optimizer=arc_instance.optimizer,
         )
 
 def benchmark_overhead(model: nn.Module, n_steps: int = 1000) -> Dict[str, float]:

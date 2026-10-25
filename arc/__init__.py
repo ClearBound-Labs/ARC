@@ -16,123 +16,110 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with ARC. If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "5.0.0"
-__author__ = "Arc Research Team"
+__version__ = "5.2.0"
+__author__ = "Aryan Kaushik"
+
+import importlib
 
 from arc.config import Config, FailureMode
 
-from arc.api.callback import Arc
-from arc.api.pytorch_callback import ArcCallback, ArcWrapper
-from arc.api.report import ReportGenerator
-
-from arc.api.v2 import ArcV2, Arc2
-
-# v3 unified API — THE canonical entry point
+# The canonical entry point; everything else is imported on first use, so
+# `import arc` doesn't pay for the legacy and research modules.
 from arc.core.controller import Controller, ControllerConfig, StepAction, HealthStatus
 from arc.signals.lyapunov import LyapunovMonitor, LyapunovState, TrainingPhase
 from arc.signals.trend import TrendDetector, DriftReport, DriftSeverity
 
-from arc.signals import (
-    SignalCollector,
-    CompositeCollector,
-    GradientCollector,
-    ActivationCollector,
-    WeightCollector,
-    OptimizerCollector,
-    LossCollector,
-    CurvatureCollector,
-)
+_LAZY = {
+    # Legacy APIs (still supported)
+    "Arc": "arc.api.callback",
+    "ArcV2": "arc.api.v2",
+    "Arc2": "arc.api.v2",
+    "ArcCallback": "arc.api.pytorch_callback",
+    "ArcWrapper": "arc.api.pytorch_callback",
+    "ReportGenerator": "arc.api.report",
+    "BulletproofTrainer": "arc.api.bulletproof",
+    "BulletproofConfig": "arc.api.bulletproof",
+    "protect": "arc.api.bulletproof",
+    "protect_trainer": "arc.api.bulletproof",
 
-from arc.features import (
-    SignalBuffer,
-    EpochSnapshot,
-    FeatureExtractor,
-    OnlineNormalizer,
-)
+    "SignalCollector": "arc.signals",
+    "CompositeCollector": "arc.signals",
+    "GradientCollector": "arc.signals",
+    "ActivationCollector": "arc.signals",
+    "WeightCollector": "arc.signals",
+    "OptimizerCollector": "arc.signals",
+    "LossCollector": "arc.signals",
+    "CurvatureCollector": "arc.signals",
+    "SilentCrashDetector": "arc.signals.silent_detector",
+    "SilentDetectorConfig": "arc.signals.silent_detector",
+    "SilentFailureType": "arc.signals.silent_detector",
 
-from arc.prediction import (
-    FailurePredictor,
-    FailurePrediction,
-    SignalAttribution,
-    AttributionEngine,
-    ProbabilityCalibrator,
-)
+    "SignalBuffer": "arc.features",
+    "EpochSnapshot": "arc.features",
+    "FeatureExtractor": "arc.features",
+    "OnlineNormalizer": "arc.features",
+    "FourierFeatureEncoder": "arc.features.spectral",
+    "SpectralAnalyzer": "arc.features.spectral",
+    "MultiScaleEncoder": "arc.features.spectral",
 
-from arc.intervention import (
-    InterventionAction,
-    InterventionRecommender,
-)
+    "FailurePredictor": "arc.prediction",
+    "FailurePrediction": "arc.prediction",
+    "SignalAttribution": "arc.prediction",
+    "AttributionEngine": "arc.prediction",
+    "ProbabilityCalibrator": "arc.prediction",
 
-from arc.evaluation import (
-    EvaluationMetrics,
-    BenchmarkSuite,
-    BenchmarkResult,
-)
+    "InterventionAction": "arc.intervention",
+    "InterventionRecommender": "arc.intervention",
+    "OOMRecoveryHandler": "arc.intervention.oom_handler",
+    "OOMConfig": "arc.intervention.oom_handler",
+    "OOMRecoveryFailed": "arc.intervention.oom_handler",
+    "get_memory_stats": "arc.intervention.oom_handler",
+    "estimate_model_memory": "arc.intervention.oom_handler",
+    "HardwareRecoveryHandler": "arc.intervention.hardware_handler",
+    "HardwareConfig": "arc.intervention.hardware_handler",
+    "get_best_device": "arc.intervention.hardware_handler",
+    "get_device_info": "arc.intervention.hardware_handler",
 
-from arc.learning import (
-    FailureSimulator,
-    TrajectoryLabeler,
-    TrainingDynamicsPredictor,
-    MetaModelTrainer,
-)
+    "EvaluationMetrics": "arc.evaluation",
+    "BenchmarkSuite": "arc.evaluation",
+    "BenchmarkResult": "arc.evaluation",
 
-try:
-    from arc.learning.ewc import ElasticWeightConsolidation, ProgressiveNet
-except ImportError:
-    ElasticWeightConsolidation = None
-    ProgressiveNet = None
+    "FailureSimulator": "arc.learning",
+    "TrajectoryLabeler": "arc.learning",
+    "TrainingDynamicsPredictor": "arc.learning",
+    "MetaModelTrainer": "arc.learning",
+    "ElasticWeightConsolidation": "arc.learning.ewc",
+    "ProgressiveNet": "arc.learning.ewc",
 
-from arc.uncertainty import (
-    ConformalPredictor,
-    ConformalRegression,
-    VennAbersCalibrator,
-)
+    "ConformalPredictor": "arc.uncertainty",
+    "ConformalRegression": "arc.uncertainty",
+    "VennAbersCalibrator": "arc.uncertainty",
 
-from arc.security import (
-    AdversarialDetector,
-    AdversarialTrainer,
-    RandomizedSmoothing,
-)
+    "AdversarialDetector": "arc.security",
+    "AdversarialTrainer": "arc.security",
+    "RandomizedSmoothing": "arc.security",
 
-from arc.physics import (
-    PINNStabilizer,
-    AdaptiveLossBalancer,
-    CurriculumScheduler,
-)
+    "PINNStabilizer": "arc.physics",
+    "AdaptiveLossBalancer": "arc.physics",
+    "CurriculumScheduler": "arc.physics",
+}
 
-from arc.features.spectral import (
-    FourierFeatureEncoder,
-    SpectralAnalyzer,
-    MultiScaleEncoder,
-)
 
-from arc.api.bulletproof import (
-    BulletproofTrainer,
-    BulletproofConfig,
-    protect,
-    protect_trainer,
-)
-from arc.intervention.oom_handler import (
-    OOMRecoveryHandler,
-    OOMConfig,
-    OOMRecoveryFailed,
-    get_memory_stats,
-    estimate_model_memory,
-)
-from arc.signals.silent_detector import (
-    SilentCrashDetector,
-    SilentDetectorConfig,
-    SilentFailureType,
-)
-from arc.intervention.hardware_handler import (
-    HardwareRecoveryHandler,
-    HardwareConfig,
-    get_best_device,
-    get_device_info,
-)
+def __getattr__(name):
+    module = _LAZY.get(name)
+    if module is None:
+        raise AttributeError(f"module 'arc' has no attribute {name!r}")
+    value = getattr(importlib.import_module(module), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY))
+
 
 __all__ = [
-    # v3 unified API (recommended)
+    # Canonical API
     "Controller",
     "ControllerConfig",
     "StepAction",
@@ -143,67 +130,8 @@ __all__ = [
     "TrendDetector",
     "DriftReport",
     "DriftSeverity",
-
-    # Legacy APIs (still supported)
-    "Arc",
-    "ArcV2",
-    "Arc2",
-    "ArcCallback",
-    "ArcWrapper",
-    "ReportGenerator",
     "Config",
     "FailureMode",
-
-    "SignalCollector",
-    "CompositeCollector",
-    "GradientCollector",
-    "ActivationCollector",
-    "WeightCollector",
-    "OptimizerCollector",
-    "LossCollector",
-    "CurvatureCollector",
-
-    "SignalBuffer",
-    "EpochSnapshot",
-    "FeatureExtractor",
-    "OnlineNormalizer",
-
-    "FailurePredictor",
-    "FailurePrediction",
-    "SignalAttribution",
-    "AttributionEngine",
-    "ProbabilityCalibrator",
-
-    "InterventionAction",
-    "InterventionRecommender",
-
-    "EvaluationMetrics",
-    "BenchmarkSuite",
-    "BenchmarkResult",
-
-    "FailureSimulator",
-    "TrajectoryLabeler",
-    "TrainingDynamicsPredictor",
-    "MetaModelTrainer",
-
-    "ElasticWeightConsolidation",
-    "ProgressiveNet",
-
-    "ConformalPredictor",
-    "ConformalRegression",
-    "VennAbersCalibrator",
-
-    "AdversarialDetector",
-    "AdversarialTrainer",
-    "RandomizedSmoothing",
-
-    "PINNStabilizer",
-    "AdaptiveLossBalancer",
-    "CurriculumScheduler",
-
-    "FourierFeatureEncoder",
-    "SpectralAnalyzer",
-    "MultiScaleEncoder",
-
     "__version__",
+    *_LAZY,
 ]

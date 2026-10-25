@@ -17,6 +17,7 @@
 # along with ARC. If not, see <https://www.gnu.org/licenses/>.
 
 from typing import Dict, Any, Optional, List, Tuple
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -216,6 +217,14 @@ class FisherCollector(SignalCollector):
 
         return importance[:top_k]
 
+    def _register_hooks(self) -> None:
+        # No forward/backward hooks needed: Fisher stats are accumulated by
+        # explicit accumulate_fisher() calls after loss.backward(), not hooks.
+        pass
+
+    def _collect_signals(self) -> Dict[str, Any]:
+        return self.compute_metrics()
+
     def collect(self) -> SignalSnapshot:
 
         self.compute_metrics()
@@ -231,7 +240,13 @@ class FisherCollector(SignalCollector):
             }
         }
 
-        return SignalSnapshot(signals=signals, overhead_ms=0)
+        return SignalSnapshot(
+            step=self._step,
+            epoch=self._epoch,
+            timestamp=time.time(),
+            signals=signals,
+            metadata=self._get_metadata(),
+        )
 
     def reset(self) -> None:
 

@@ -1,21 +1,3 @@
-# ARC (Automatic Recovery Controller) - Self-Healing Neural Networks
-# Copyright (c) 2026 Aryan Kaushik. All rights reserved.
-#
-# This file is part of ARC.
-#
-# ARC is free software: you can redistribute it and/or modify it under the
-# terms of the GNU Affero General Public License as published by the Free
-# Software Foundation, either version 3 of the License, or (at your option)
-# any later version.
-#
-# ARC is distributed in the hope that it will be useful, but WITHOUT ANY
-# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-# FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for
-# more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with ARC. If not, see <https://www.gnu.org/licenses/>.
-
 import torch
 import torch.nn as nn
 from typing import Optional, Dict, Any, Callable, Union, Tuple, List
@@ -37,6 +19,7 @@ from arc.intervention.hardware_handler import (
     get_best_device, get_device_info
 )
 from arc.intervention.rollback import WeightRollback, RollbackConfig, RollbackAction
+from arc._logging import log as _log
 
 @dataclass
 class BulletproofConfig:
@@ -91,6 +74,25 @@ class BulletproofConfig:
         config.rollback_config.layer_sample_ratio = 0.1
         config.validation_interval = 500
         return config
+
+@dataclass
+class TrainStepResult:
+    """Result of a single BulletproofTrainer.train_step() call.
+
+    `loss` is None whenever the step didn't complete normally (numeric
+    rollback, OOM exhaustion, or a recovered hardware error) — check
+    `should_skip`/`failure_type` rather than inferring failure from a bare
+    `None`.
+    """
+    step: int = 0
+    loss: Optional[torch.Tensor] = None
+    should_skip: bool = False
+    rolled_back: bool = False
+    oom_recovered: bool = False
+    oom_exhausted: bool = False
+    hardware_recovered: bool = False
+    failure_type: Optional[str] = None
+    message: str = ""
 
 class BulletproofTrainer:
     def __init__(
@@ -156,35 +158,35 @@ class BulletproofTrainer:
 
         if any(t in model_str for t in ['gpt', 'llama', 'bert', 'transformer']):
             if self.config.verbose:
-                print("Detected Transformer/LLM architecture")
+                _log("Detected Transformer/LLM architecture")
             if self.rollback:
                 self.rollback.config.loss_explosion_threshold = 50.0
 
         elif 'gan' in model_str or 'discriminator' in model_str or 'generator' in model_str:
             if self.config.verbose:
-                print("   Detected GAN architecture")
+                _log("   Detected GAN architecture")
             if self.silent_detector:
                 self.silent_detector.config.detect_mode_collapse = True
 
         elif 'vae' in model_str or 'autoencoder' in model_str:
             if self.config.verbose:
-                print("   Detected VAE architecture")
+                _log("   Detected VAE architecture")
             if self.silent_detector:
                 self.silent_detector.config.detect_posterior_collapse = True
 
     def _print_init_info(self):
-        print("=" * 60)
-        print("BulletproofTrainer Initialized")
-        print("=" * 60)
-        print(f"   Device: {self.device}")
-        print(f"   OOM Recovery: {'✓' if self.oom_handler else '✗'}")
-        print(f"   Numeric Recovery: {'✓' if self.rollback else '✗'}")
-        print(f"   Silent Detection: {'✓' if self.silent_detector else '✗'}")
-        print(f"   Hardware Recovery: {'✓' if self.hardware_handler else '✗'}")
+        _log("=" * 60)
+        _log("BulletproofTrainer Initialized")
+        _log("=" * 60)
+        _log(f"   Device: {self.device}")
+        _log(f"   OOM Recovery: {'✓' if self.oom_handler else '✗'}")
+        _log(f"   Numeric Recovery: {'✓' if self.rollback else '✗'}")
+        _log(f"   Silent Detection: {'✓' if self.silent_detector else '✗'}")
+        _log(f"   Hardware Recovery: {'✓' if self.hardware_handler else '✗'}")
 
         mem = estimate_model_memory(self.model)
-        print(f"   Model Memory: {mem['total_gb']:.2f} GB estimated")
-        print("=" * 60)
+        _log(f"   Model Memory: {mem['total_gb']:.2f} GB estimated")
+        _log("=" * 60)
 
     def train_step(
         self,
@@ -193,7 +195,7 @@ class BulletproofTrainer:
         backward_fn: Optional[Callable[[torch.Tensor], None]] = None,
         val_metric: Optional[float] = None,
         **kwargs
-    ) -> Optional[torch.Tensor]:
+    ) -> TrainStepResult:
         self.step += 1
 
         try:
@@ -209,12 +211,6 @@ class BulletproofTrainer:
 
             self._current_loss = loss.detach()
 
-            if self.rollback:
-                action = self.rollback.step(loss)
-                if action.rolled_back:
-                    self._log_recovery("numeric", action)
-                    return None
-
             if self.oom_handler:
                 if self.scaler:
                     self.scaler.scale(loss).backward()
@@ -227,6 +223,30 @@ class BulletproofTrainer:
                     self.scaler.scale(loss).backward()
                 else:
                     loss.backward()
+
+            # Checks run on this step's gradients, at their true scale.
+            fp16_overflow = False
+            if self.scaler:
+                self.scaler.unscale_(self.optimizer)
+                fp16_overflow = bool(torch.isfinite(loss.detach()).item()) and not all(
+                    bool(torch.isfinite(p.grad).all())
+                    for p in self.model.parameters() if p.grad is not None
+                )
+
+            if self.rollback and not fp16_overflow:
+                action = self.rollback.step(loss)
+                if action.should_skip:
+                    self._log_recovery("numeric", action)
+                    if self.scaler:
+                        self.scaler.update()  # reset after unscale_; step is skipped
+                    return TrainStepResult(
+                        step=self.step,
+                        should_skip=True,
+                        rolled_back=action.rolled_back,
+                        failure_type=action.failure_type or "numeric",
+                        message=("numeric rollback triggered" if action.rolled_back
+                                 else "numeric failure detected; step skipped"),
+                    )
 
             if self.scaler:
                 self.scaler.step(self.optimizer)
@@ -245,20 +265,32 @@ class BulletproofTrainer:
             if self.config.verbose and self.step % self.config.log_interval == 0:
                 self._log_status(loss.item())
 
-            return loss
+            return TrainStepResult(step=self.step, loss=loss)
 
         except OOMRecoveryFailed as e:
             self._log_recovery("oom_exhausted", {"error": str(e)})
             warnings.warn(f"OOM recovery exhausted: {e}")
             self._is_healthy = False
-            return None
+            return TrainStepResult(
+                step=self.step,
+                should_skip=True,
+                oom_exhausted=True,
+                failure_type="oom_exhausted",
+                message=str(e),
+            )
 
         except Exception as e:
             if self.hardware_handler:
                 result = self.hardware_handler.try_recover(e)
                 if result.success:
                     self._log_recovery("hardware", result)
-                    return None
+                    return TrainStepResult(
+                        step=self.step,
+                        should_skip=True,
+                        hardware_recovered=True,
+                        failure_type="hardware",
+                        message=str(e),
+                    )
 
             raise
 
@@ -285,9 +317,9 @@ class BulletproofTrainer:
 
             if result.severity > 0.7 and self.rollback:
                 if self.config.verbose:
-                    print(f"   Triggering rollback due to severe {result.failure_type.name}")
-                self.rollback._restore_checkpoint()
-                self.rollback._reduce_learning_rate()
+                    _log(f"   Triggering rollback due to severe {result.failure_type.name}")
+                self.rollback.restore_checkpoint()
+                self.rollback.reduce_learning_rate()
 
     def _log_recovery(self, recovery_type: str, details: Any):
         self.total_recoveries += 1
@@ -300,7 +332,7 @@ class BulletproofTrainer:
         self.recovery_log.append(entry)
 
         if self.config.verbose:
-            print(f"Recovery #{self.total_recoveries}: {recovery_type} at step {self.step}")
+            _log(f"Recovery #{self.total_recoveries}: {recovery_type} at step {self.step}")
 
     def _log_status(self, loss: float):
         status = f"Step {self.step} | Loss: {loss:.4f}"
@@ -313,7 +345,7 @@ class BulletproofTrainer:
             if stats['oom_count'] > 0:
                 status += f" | OOMs: {stats['oom_count']}"
 
-        print(status)
+        _log(status)
 
     def safe_step(self):
         return BulletproofContext(self)
@@ -422,27 +454,13 @@ def protect_trainer(hf_trainer, **kwargs):
 
     return hf_trainer
 
-class ARCCallback:
-    def __init__(self, config: Optional[BulletproofConfig] = None):
-        self.config = config or BulletproofConfig()
-        self.bulletproof: Optional[BulletproofTrainer] = None
+def ARCCallback(config: Optional[BulletproofConfig] = None):
+    """Deprecated: returns `arc.api.integrations.LightningCallback`, which
+    checks each step before the optimizer runs (this callback used to act
+    only after the step had already been applied)."""
+    from arc.api.integrations import LightningCallback
 
-    def on_train_start(self, trainer, pl_module):
-        self.bulletproof = BulletproofTrainer(
-            pl_module,
-            trainer.optimizers[0] if trainer.optimizers else None,
-            config=self.config,
-        )
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if self.bulletproof and outputs is not None:
-            loss = outputs.get('loss') if isinstance(outputs, dict) else outputs
-            if isinstance(loss, torch.Tensor):
-                if self.bulletproof.rollback:
-                    action = self.bulletproof.rollback.step(loss)
-                    if action.rolled_back:
-                        print(f"ARC rolled back at batch {batch_idx}")
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        if self.bulletproof:
-            self.bulletproof.end_epoch()
+    warnings.warn("ARCCallback is deprecated; use arc.api.integrations.LightningCallback",
+                  DeprecationWarning, stacklevel=2)
+    verbose = config.verbose if config is not None else True
+    return LightningCallback(verbose=verbose)

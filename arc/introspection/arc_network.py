@@ -63,12 +63,12 @@ class IntrospectiveState:
     step: int = 0
 
 @dataclass
-class InterventionAction:
+class IntrospectionAction:
     action_type: str
     magnitude: float
     rationale: str
 
-class Arc(nn.Module):
+class IntrospectiveArc(nn.Module):
     def __init__(
         self,
         base_model: nn.Module,
@@ -152,7 +152,7 @@ class Arc(nn.Module):
         if self.transport and self.scheduler.should_run_module("transport", state.risk_score):
             state.transport = self.transport.update()
 
-        if self.self_model:
+        if self.self_model and self.scheduler.should_run_module("self_model", state.risk_score):
             state.self_knowledge = self.self_model.introspect(loss.item())
 
         state = self._compute_meta_analysis(state)
@@ -295,6 +295,9 @@ class IntrospectionScheduler:
         if module_name == "topology":
             return risk_score > 0.6
 
+        if module_name == "self_model":
+            return risk_score > 0.3 or self.step_counter % 20 == 0
+
         return True
 
     def step(self):
@@ -338,7 +341,7 @@ def create_self_aware_model(
     base_model: nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
     level: str = "standard",
-) -> Arc:
+) -> IntrospectiveArc:
     configs = {
         "minimal": {
             "enable_geometry": True,
@@ -365,4 +368,4 @@ def create_self_aware_model(
 
     config = configs.get(level, configs["standard"])
 
-    return Arc(base_model, optimizer=optimizer, **config)
+    return IntrospectiveArc(base_model, optimizer=optimizer, **config)

@@ -16,21 +16,21 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with ARC. If not, see <https://www.gnu.org/licenses/>.
 
+import copy
+import hashlib
+import hmac
+import io
+import os
+from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Optional, Dict, Any, List
+
 import torch
 import torch.nn as nn
-import os
-import tempfile
-import shutil
+
 from arc.config import default_checkpoint_dir
-from typing import Optional, Dict, Any, List, Tuple, Union
-from dataclasses import dataclass, field
-from collections import deque
-from enum import Enum, auto
-import pickle
-import warnings
-import gc
-import struct
-import io
+from arc._logging import log as _log
 
 class CheckpointStrategy(Enum):
     FULL_CPU = auto()
@@ -52,11 +52,22 @@ class AdaptiveCheckpointConfig:
     delta_threshold: float = 1e-6
     delta_check_layers: int = 10
 
-    quantize_optimizer: bool = True
+    # Opt-in: store optimizer state as bf16 (fp32's exponent range, so Adam's
+    # tiny second moments survive; fp16/int8 would flush them to zero).
+    quantize_optimizer: bool = False
 
     disk_checkpoint_dir: str = default_checkpoint_dir("checkpoints")
     max_disk_checkpoints: int = 3
     compress_disk: bool = False
+
+    # Checkpoint integrity & signing: sha256 content hash always
+    # verified on restore if present; HMAC signature verified too if a key
+    # is configured, proving the checkpoint wasn't tampered with off-key.
+    sign_checkpoints: bool = False
+    signing_key: Optional[str] = field(default=None, repr=False)
+    # Permit weights_only=False when loading disk checkpoints (can execute
+    # code). Only for checkpoint directories nobody else can write to.
+    allow_unsafe_load: bool = False
 
     shard_count: int = 4
 
@@ -73,7 +84,14 @@ class CheckpointMetadata:
     compression_ratio: float
     timestamp: float
     is_incremental: bool = False
-    base_checkpoint_idx: Optional[int] = None
+    # Stable checkpoint_id of the base full checkpoint this delta applies on
+    # top of (matches CheckpointMetadata.step's companion checkpoint_id in
+    # the stored checkpoint dict). NOT a positional index into `checkpoints`
+    # -- that deque rotates as old entries are evicted, so a positional
+    # index silently points to the wrong checkpoint once maxlen is exceeded.
+    # Actual restore already resolves via this stable id (see
+    # _resolve_incremental), this field just mirrors it for introspection.
+    base_checkpoint_id: Optional[int] = None
 
 class AdaptiveCheckpointer:
     def __init__(
@@ -85,6 +103,7 @@ class AdaptiveCheckpointer:
         self.model = model
         self.optimizer = optimizer
         self.config = config or AdaptiveCheckpointConfig()
+        self.device = next(model.parameters()).device
 
         self.checkpoints: deque = deque(maxlen=self.config.max_checkpoints)
         self.metadata: List[CheckpointMetadata] = []
@@ -94,6 +113,12 @@ class AdaptiveCheckpointer:
         self._last_full_state: Optional[Dict[str, torch.Tensor]] = None
         self._next_checkpoint_id: int = 0
         self._last_full_checkpoint_id: Optional[int] = None
+        # Most recent checkpoint's id, full or incremental -- an incremental
+        # delta chains off whichever checkpoint immediately preceded it, not
+        # always the last *full* one, or a delta-of-a-delta reconstructs from
+        # a stale base and silently drops every change made since (see
+        # _resolve_incremental).
+        self._last_checkpoint_id: Optional[int] = None
 
         self.model_size_bytes = self._calculate_model_size()
         self.optimizer_size_bytes = self._calculate_optimizer_size()
@@ -156,13 +181,15 @@ class AdaptiveCheckpointer:
                 return CheckpointStrategy.STREAMING_DISK
 
         except Exception:
-            return CheckpointStrategy.QUANTIZED_FP16
+            # No memory info (e.g. psutil not installed): keep exact checkpoints
+            # rather than silently trading away precision.
+            return CheckpointStrategy.FULL_CPU
 
     def _print_init_info(self):
-        print(f"AdaptiveCheckpointer initialized")
-        print(f"   Model size: {self.model_size_bytes / 1e9:.2f} GB")
-        print(f"   Optimizer size: {self.optimizer_size_bytes / 1e9:.2f} GB")
-        print(f"   Strategy: {self.current_strategy.name}")
+        _log(f"AdaptiveCheckpointer initialized")
+        _log(f"   Model size: {self.model_size_bytes / 1e9:.2f} GB")
+        _log(f"   Optimizer size: {self.optimizer_size_bytes / 1e9:.2f} GB")
+        _log(f"   Strategy: {self.current_strategy.name}")
 
     def save(self, step: Optional[int] = None) -> CheckpointMetadata:
         self.step = step or self.step + 1
@@ -208,7 +235,10 @@ class AdaptiveCheckpointer:
 
         checkpoint['checkpoint_id'] = self._next_checkpoint_id
         self._last_full_checkpoint_id = self._next_checkpoint_id
+        self._last_checkpoint_id = self._next_checkpoint_id
         self._next_checkpoint_id += 1
+
+        self._apply_integrity_fields(checkpoint)
 
         self.checkpoints.append(checkpoint)
         self._last_full_state = checkpoint['model']
@@ -224,43 +254,57 @@ class AdaptiveCheckpointer:
         self.metadata.append(metadata)
 
         if self.config.verbose:
-            print(f"   Saved full CPU checkpoint at step {self.step} ({checkpoint_size / 1e6:.1f} MB)")
+            _log(f"   Saved full CPU checkpoint at step {self.step} ({checkpoint_size / 1e6:.1f} MB)")
 
         return metadata
 
     def _save_quantized(self, dtype: torch.dtype = torch.float16) -> CheckpointMetadata:
         import time
 
-        def quantize_state_dict(state_dict: Dict) -> Dict:
-            quantized = {}
-            for k, v in state_dict.items():
-                if isinstance(v, torch.Tensor) and v.is_floating_point():
-                    quantized[k] = v.cpu().to(dtype)
-                elif isinstance(v, torch.Tensor):
-                    quantized[k] = v.cpu().clone()
-                else:
-                    quantized[k] = v
-            return quantized
+        scales: Dict[str, float] = {}
 
-        checkpoint = {
-            'model': quantize_state_dict(self.model.state_dict()),
-            'optimizer': {},
-            'step': self.step,
-            'dtype': str(dtype),
+        def quantize(name: str, v: torch.Tensor) -> torch.Tensor:
+            v = v.detach().cpu()
+            if dtype == torch.int8:
+                # Symmetric per-tensor int8: q = round(v / s), s = max|v| / 127.
+                scale = float(v.abs().max()) / 127.0 if v.numel() else 0.0
+                scale = scale or 1.0
+                scales[name] = scale
+                return torch.round(v.float() / scale).clamp_(-127, 127).to(torch.int8)
+            return v.to(dtype)
+
+        model_q = {
+            k: (quantize(k, v) if isinstance(v, torch.Tensor) and v.is_floating_point()
+                else v.detach().cpu().clone() if isinstance(v, torch.Tensor) else v)
+            for k, v in self.model.state_dict().items()
         }
 
-        if self.config.quantize_optimizer:
-            for k, v in self.optimizer.state.items():
-                checkpoint['optimizer'][k] = {
-                    k2: (v2.cpu().to(dtype) if isinstance(v2, torch.Tensor) and v2.is_floating_point()
-                         else v2.cpu().clone() if isinstance(v2, torch.Tensor) else v2)
-                    for k2, v2 in v.items()
-                }
+        opt_dtype = torch.bfloat16 if self.config.quantize_optimizer else None
+        optimizer_q = {
+            k: {
+                k2: (v2.detach().cpu().to(opt_dtype)
+                     if opt_dtype is not None and isinstance(v2, torch.Tensor) and v2.is_floating_point()
+                     and v2.dim() > 0
+                     else v2.detach().cpu().clone() if isinstance(v2, torch.Tensor) else copy.deepcopy(v2))
+                for k2, v2 in v.items()
+            }
+            for k, v in self.optimizer.state.items()
+        }
+
+        checkpoint = {
+            'model': model_q,
+            'optimizer': optimizer_q,
+            'step': self.step,
+            'dtype': str(dtype),
+            'scales': scales,
+        }
 
         checkpoint_size = sum(
             v.numel() * v.element_size()
             for v in checkpoint['model'].values()
         )
+
+        self._apply_integrity_fields(checkpoint)
 
         self.checkpoints.append(checkpoint)
 
@@ -277,7 +321,7 @@ class AdaptiveCheckpointer:
         self.metadata.append(metadata)
 
         if self.config.verbose:
-            print(f"   Saved quantized checkpoint ({compression:.1f}x compression)")
+            _log(f"   Saved quantized checkpoint ({compression:.1f}x compression)")
 
         return metadata
 
@@ -300,17 +344,20 @@ class AdaptiveCheckpointer:
 
         checkpoint = {
             'delta': delta,
-            'base_id': self._last_full_checkpoint_id,
+            'base_id': self._last_checkpoint_id,
             'checkpoint_id': self._next_checkpoint_id,
             'step': self.step,
             'is_incremental': True,
         }
+        self._last_checkpoint_id = self._next_checkpoint_id
         self._next_checkpoint_id += 1
 
         checkpoint_size = sum(
             v.numel() * v.element_size()
             for v in delta.values()
         )
+
+        self._apply_integrity_fields(checkpoint)
 
         self.checkpoints.append(checkpoint)
 
@@ -326,14 +373,43 @@ class AdaptiveCheckpointer:
             compression_ratio=compression,
             timestamp=time.time(),
             is_incremental=True,
-            base_checkpoint_idx=len(self.checkpoints) - 2,
+            base_checkpoint_id=checkpoint['base_id'],
         )
         self.metadata.append(metadata)
 
         if self.config.verbose:
-            print(f"   Saved incremental checkpoint ({len(delta)}/{len(current_state)} params changed, {compression:.1f}x compression)")
+            _log(f"   Saved incremental checkpoint ({len(delta)}/{len(current_state)} params changed, {compression:.1f}x compression)")
 
         return metadata
+
+    def _content_hash(self, checkpoint: dict) -> str:
+        """sha256 over the checkpoint dict's actual content (everything
+        except the integrity fields themselves), independent of pickle
+        metadata ordering, so re-saving identical content reproduces the
+        same hash. Works for any save strategy's checkpoint shape (full
+        model/optimizer, quantized, or an incremental delta) since it just
+        hashes whatever's actually in the dict."""
+        to_hash = {k: v for k, v in checkpoint.items() if k not in ("integrity_hash", "integrity_signature")}
+        buf = io.BytesIO()
+        torch.save(to_hash, buf)
+        return hashlib.sha256(buf.getvalue()).hexdigest()
+
+    def _sign(self, content_hash: str) -> str:
+        return hmac.new(
+            self.config.signing_key.encode(), content_hash.encode(), hashlib.sha256
+        ).hexdigest()
+
+    def _apply_integrity_fields(self, checkpoint: dict) -> None:
+        """Adds `integrity_hash`/`integrity_signature` to `checkpoint` in
+        place when `config.sign_checkpoints` is set -- called from every
+        save strategy, not just disk saves, so enabling signing actually
+        protects whichever strategy got auto-selected."""
+        if not self.config.sign_checkpoints:
+            return
+        content_hash = self._content_hash(checkpoint)
+        checkpoint['integrity_hash'] = content_hash
+        if self.config.signing_key:
+            checkpoint['integrity_signature'] = self._sign(content_hash)
 
     def _save_to_disk(self) -> CheckpointMetadata:
         import time
@@ -345,11 +421,30 @@ class AdaptiveCheckpointer:
             f"checkpoint_{self.step}.pt"
         )
 
+        # Name-keyed, not Parameter-object-keyed: this checkpoint round-trips
+        # through torch.save/torch.load, and pickling a Parameter deserializes
+        # it as a brand-new tensor object with no identity relationship to the
+        # live self.optimizer.state's Parameter keys. Keying by the object
+        # itself (as _save_full_cpu/_save_quantized do for their in-memory-only
+        # checkpoints) would make every entry silently unmatchable on restore.
+        # Parameter names survive serialization and can be re-resolved against
+        # the live model in restore().
+        param_names = {p: n for n, p in self.model.named_parameters()}
         checkpoint = {
             'model': self.model.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
+            'optimizer': {
+                param_names[k]: {
+                    k2: v2.clone() if isinstance(v2, torch.Tensor) else v2
+                    for k2, v2 in v.items()
+                }
+                for k, v in self.optimizer.state.items()
+                if k in param_names
+            },
+            'optimizer_keyed_by_name': True,
             'step': self.step,
         }
+
+        self._apply_integrity_fields(checkpoint)
 
         torch.save(checkpoint, filename)
 
@@ -368,7 +463,7 @@ class AdaptiveCheckpointer:
         self.metadata.append(metadata)
 
         if self.config.verbose:
-            print(f"   Saved to disk: {filename}")
+            _log(f"   Saved to disk: {filename}")
 
         return metadata
 
@@ -379,7 +474,14 @@ class AdaptiveCheckpointer:
             if f.startswith('checkpoint_') and f.endswith('.pt')
         ], key=os.path.getmtime)
 
-        while len(files) >= self.config.max_disk_checkpoints:
+        # `self.checkpoints` (the in-memory deque) can hold up to
+        # config.max_checkpoints entries pointing at disk files. If
+        # max_disk_checkpoints < max_checkpoints, pruning to max_disk_checkpoints
+        # alone would delete a file still referenced by a live deque entry,
+        # so restore() would fail with a missing file. Always retain at least
+        # as many files as the deque can reference.
+        retain = max(self.config.max_disk_checkpoints, self.config.max_checkpoints)
+        while len(files) >= retain:
             try:
                 os.remove(files.pop(0))
             except Exception:
@@ -392,56 +494,73 @@ class AdaptiveCheckpointer:
         checkpoint = self.checkpoints[checkpoint_idx]
 
         if isinstance(checkpoint, dict) and 'path' in checkpoint:
-            _ckpt_path = checkpoint['path']
-            try:
-                checkpoint = torch.load(_ckpt_path, map_location=self.device, weights_only=True)
-            except TypeError:
-                # PyTorch <1.13 doesn't support weights_only; fall back transparently
-                checkpoint = torch.load(_ckpt_path, map_location=self.device)
-            except (pickle.UnpicklingError, RuntimeError) as exc:
-                # Discriminate: pickle.UnpicklingError is always a weights_only rejection;
-                # RuntimeError is only a weights_only rejection if the message says so.
-                # Other RuntimeErrors (file corruption, device mismatch, missing keys, I/O)
-                # must propagate rather than silently fall back to the unsafe path.
-                msg = str(exc).lower()
-                looks_like_weights_only_rejection = (
-                    isinstance(exc, pickle.UnpicklingError)
-                    or "weights only" in msg
-                    or "unsupported global" in msg
-                    or "weightsunpicklererror" in msg
+            from arc._serialization import safe_torch_load
+            checkpoint = safe_torch_load(
+                checkpoint['path'], map_location=self.device,
+                allow_unsafe=self.config.allow_unsafe_load,
+            )
+
+        if 'integrity_hash' in checkpoint:
+            actual_hash = self._content_hash(checkpoint)
+            if actual_hash != checkpoint['integrity_hash']:
+                raise ValueError(
+                    "Checkpoint integrity check failed: content hash mismatch, "
+                    "file may be corrupted or tampered with."
                 )
-                if not looks_like_weights_only_rejection:
-                    raise
-                warnings.warn(
-                    f"Loading {_ckpt_path} with weights_only=False. "
-                    "Only do this for checkpoints you produced yourself. "
-                    "See SECURITY.md for the checkpoint trust boundary.",
-                    stacklevel=2,
-                )
-                checkpoint = torch.load(_ckpt_path, map_location=self.device, weights_only=False)
+            if 'integrity_signature' in checkpoint:
+                if not self.config.signing_key:
+                    raise ValueError(
+                        "Checkpoint is signed but no signing_key is configured to verify it."
+                    )
+                expected_sig = self._sign(actual_hash)
+                if not hmac.compare_digest(expected_sig, checkpoint['integrity_signature']):
+                    raise ValueError(
+                        "Checkpoint signature verification failed: signature does not match "
+                        "configured signing_key."
+                    )
 
         if checkpoint.get('is_incremental', False):
             checkpoint = self._resolve_incremental(checkpoint)
 
         if 'model' in checkpoint:
-            model_state = checkpoint['model']
-            device = next(self.model.parameters()).device
+            scales = checkpoint.get('scales', {})
+            live = self.model.state_dict()
             restored_state = {}
-            for k, v in model_state.items():
+            for k, v in checkpoint['model'].items():
                 if isinstance(v, torch.Tensor):
-                    restored_state[k] = v.to(device=device, dtype=torch.float32)
-                else:
-                    restored_state[k] = v
+                    if k in scales:
+                        v = v.float() * scales[k]  # dequantize int8
+                    target = live.get(k)
+                    if target is not None:
+                        v = v.to(device=target.device, dtype=target.dtype)
+                restored_state[k] = v
             self.model.load_state_dict(restored_state)
 
         if 'optimizer' in checkpoint and checkpoint['optimizer']:
-            if isinstance(list(checkpoint['optimizer'].values())[0] if checkpoint['optimizer'] else None, dict):
-                device = next(self.model.parameters()).device
-                for k, v in checkpoint['optimizer'].items():
-                    if k in self.optimizer.state:
-                        for k2, v2 in v.items():
-                            if isinstance(v2, torch.Tensor):
-                                self.optimizer.state[k][k2] = v2.to(device=device, dtype=torch.float32)
+            if checkpoint.get('optimizer_keyed_by_name', False):
+                # Disk-persisted checkpoint: keys are parameter names (see
+                # _save_to_disk), not live Parameter objects. Resolve back to
+                # the current model's Parameter objects by name.
+                name_to_param = {n: p for n, p in self.model.named_parameters()}
+                saved = {name_to_param[n]: v for n, v in checkpoint['optimizer'].items()
+                         if n in name_to_param}
+            else:
+                saved = checkpoint['optimizer']
+            for p, v in saved.items():
+                if not isinstance(v, dict) or p not in self.optimizer.state:
+                    continue
+                live_state = self.optimizer.state[p]
+                for k2, v2 in v.items():
+                    if isinstance(v2, torch.Tensor):
+                        # Back to the live tensor's device and dtype (undoes an
+                        # opt-in bf16 quantization; never upcasts silently).
+                        ref = live_state.get(k2)
+                        if isinstance(ref, torch.Tensor):
+                            live_state[k2] = v2.to(device=ref.device, dtype=ref.dtype).clone()
+                        else:
+                            live_state[k2] = v2.to(device=p.device).clone()
+                    else:
+                        live_state[k2] = copy.deepcopy(v2)
 
         if 'rng' in checkpoint:
             torch.set_rng_state(checkpoint['rng']['torch'])
@@ -451,7 +570,7 @@ class AdaptiveCheckpointer:
         restored_step = checkpoint.get('step', 0)
 
         if self.config.verbose:
-            print(f"   Restored checkpoint from step {restored_step}")
+            _log(f"   Restored checkpoint from step {restored_step}")
 
         return restored_step
 
@@ -466,6 +585,12 @@ class AdaptiveCheckpointer:
                 f"Base checkpoint with id={checkpoint.get('base_id')} not found. "
                 f"It may have been evicted from the deque."
             )
+
+        # The base itself may be another incremental delta (a delta chained
+        # off a delta) -- resolve it first so every intermediate change gets
+        # applied, not just the latest delta's.
+        if base_checkpoint.get('is_incremental', False):
+            base_checkpoint = self._resolve_incremental(base_checkpoint)
 
         full_state = base_checkpoint['model'].copy()
         for k, v in checkpoint['delta'].items():

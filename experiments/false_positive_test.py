@@ -48,6 +48,8 @@ from arc.core.self_healing import SelfHealingArc, SelfHealingConfig
 # =============================================================================
 
 class TestModel(nn.Module):
+    __test__ = False  # not a pytest test class, just named "Test*"
+
     def __init__(self):
         super().__init__()
         self.fc1 = nn.Linear(100, 256)

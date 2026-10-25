@@ -68,3 +68,42 @@ class TestSelfHealingArc:
         
         # Verify the flag was NOT set
         assert action.gradients_clipped is False, "Baseline clipping should not run when disabled"
+
+    def test_no_clipping_unless_asked(self):
+        model = nn.Linear(10, 10)
+        arc = SelfHealingArc(model, torch.optim.SGD(model.parameters(), lr=0.01),
+                             SelfHealingConfig(enable_forecasting=False, verbose=False))
+        (model(torch.randn(2, 10)).sum() * 100).backward()
+        before = [p.grad.clone() for p in model.parameters()]
+
+        assert arc.post_backward().gradients_clipped is False
+        assert all(torch.equal(b, p.grad) for b, p in zip(before, model.parameters()))
+
+    def test_repeated_rollbacks_reduce_lr_exactly_once_each(self):
+        torch.manual_seed(0)
+        model = nn.Linear(10, 1)
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+        arc = SelfHealingArc(model, opt, SelfHealingConfig(
+            checkpoint_frequency=2, adaptive_checkpoint_frequency=False,
+            lr_reduction_factor=0.1, verbose=False))
+
+        def healthy(n):
+            for _ in range(n):
+                loss = model(torch.randn(4, 10)).pow(2).mean()
+                opt.zero_grad()
+                loss.backward()
+                if not arc.step(loss).should_skip:
+                    opt.step()
+
+        healthy(4)
+        arc.step(torch.tensor(float("nan")))
+        assert opt.param_groups[0]["lr"] == pytest.approx(1e-3)
+        healthy(6)  # a fresh checkpoint is taken at the reduced LR
+        arc.step(torch.tensor(float("nan")))
+        assert opt.param_groups[0]["lr"] == pytest.approx(1e-4)
+
+    def test_is_deprecated_in_favour_of_controller(self):
+        model = nn.Linear(2, 2)
+        with pytest.warns(FutureWarning, match="arc.Controller"):
+            SelfHealingArc(model, torch.optim.SGD(model.parameters(), lr=0.1),
+                           SelfHealingConfig(verbose=False))

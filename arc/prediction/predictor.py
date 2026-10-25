@@ -16,8 +16,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with ARC. If not, see <https://www.gnu.org/licenses/>.
 
-import pickle
-import warnings
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List, Tuple
 import numpy as np
@@ -143,34 +141,10 @@ class FailurePredictor:
 
         self._current_epoch = 0
 
-    def _load_model(self, path: str) -> TrainingDynamicsPredictor:
+    def _load_model(self, path: str, allow_unsafe: bool = False) -> TrainingDynamicsPredictor:
+        from arc._serialization import safe_torch_load
 
-        try:
-            checkpoint = torch.load(path, map_location=self.device, weights_only=True)
-        except TypeError:
-            # PyTorch <1.13 doesn't support weights_only; fall back transparently
-            checkpoint = torch.load(path, map_location=self.device)
-        except (pickle.UnpicklingError, RuntimeError) as exc:
-            # Discriminate: pickle.UnpicklingError is always a weights_only rejection;
-            # RuntimeError is only a weights_only rejection if the message says so.
-            # Other RuntimeErrors (file corruption, device mismatch, missing keys, I/O)
-            # must propagate rather than silently fall back to the unsafe path.
-            msg = str(exc).lower()
-            looks_like_weights_only_rejection = (
-                isinstance(exc, pickle.UnpicklingError)
-                or "weights only" in msg
-                or "unsupported global" in msg
-                or "weightsunpicklererror" in msg
-            )
-            if not looks_like_weights_only_rejection:
-                raise
-            warnings.warn(
-                f"Loading {path} with weights_only=False. "
-                "Only do this for checkpoints you produced yourself. "
-                "See SECURITY.md for the checkpoint trust boundary.",
-                stacklevel=2,
-            )
-            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        checkpoint = safe_torch_load(path, map_location=self.device, allow_unsafe=allow_unsafe)
 
         state_dict = checkpoint.get("model_state_dict", checkpoint)
         n_features = state_dict["input_proj.0.weight"].shape[1]
@@ -203,20 +177,21 @@ class FailurePredictor:
         if len(self.buffer) < self.config.feature.min_history:
             return self._create_insufficient_data_prediction()
 
+        if self.model is None:
+            # Never predict with randomly initialised weights: the output
+            # would look like a risk score and mean nothing.
+            return self._unknown_prediction(
+                "No trained failure-prediction model loaded (pass model_path). "
+                "ARC reports no risk rather than guessing.")
+
         features = self._extract_features()
         features_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
         features_tensor = features_tensor.to(self.device)
 
-        if self.model is None:
-            n_features = features_tensor.shape[2]
-            self.model = TrainingDynamicsPredictor(
-                config=self.config.prediction,
-                n_features=n_features,
-            ).to(self.device)
-            self.model.eval()
-
-            from arc.prediction.attribution import AttributionEngine
-            self.attribution_engine = AttributionEngine(self.model)
+        if features_tensor.shape[2] != self.model.n_features:
+            return self._unknown_prediction(
+                f"Loaded model expects {self.model.n_features} features but this run "
+                f"produces {features_tensor.shape[2]}; it was trained on different signals.")
 
         with torch.no_grad():
             mc_output = self.model.predict_with_uncertainty(
@@ -476,6 +451,11 @@ class FailurePredictor:
             return "critical"
 
     def _create_insufficient_data_prediction(self) -> FailurePrediction:
+        return self._unknown_prediction(
+            f"Insufficient history ({len(self.buffer)} epochs). "
+            f"Need {self.config.feature.min_history} epochs minimum.")
+
+    def _unknown_prediction(self, rationale: str) -> FailurePrediction:
 
         probs = {mode: 0.0 for mode in FailureMode}
         cis = {mode: (0.0, 0.5) for mode in FailureMode}
@@ -492,8 +472,8 @@ class FailurePredictor:
             recommendation=InterventionRecommendation(
                 action="no_action",
                 confidence=0.0,
-                rationale=f"Insufficient history ({len(self.buffer)} epochs). Need {self.config.feature.min_history} epochs minimum.",
-                caveats=["Predictions unavailable until sufficient data collected."],
+                rationale=rationale,
+                caveats=["No prediction was made."],
             ),
             overall_risk=0.0,
             risk_level="unknown",

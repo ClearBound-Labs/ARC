@@ -16,6 +16,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with ARC. If not, see <https://www.gnu.org/licenses/>.
 
+import time
 from typing import Dict, Any, Optional, List, Tuple
 import numpy as np
 import torch
@@ -41,6 +42,7 @@ class NeuralCollapseCollector(SignalCollector):
         self._class_features: Dict[int, List[torch.Tensor]] = {
             i: [] for i in range(num_classes)
         }
+        self._class_seen: Dict[int, int] = {i: 0 for i in range(num_classes)}
         self._class_means: Optional[torch.Tensor] = None
         self._global_mean: Optional[torch.Tensor] = None
         self._classifier_weights: Optional[torch.Tensor] = None
@@ -103,13 +105,19 @@ class NeuralCollapseCollector(SignalCollector):
             c = int(labels[i].item())
             if c < self.num_classes:
 
-                if len(self._class_features[c]) < 1000:
-                    self._class_features[c].append(features[i])
-                else:
+                self._class_seen[c] += 1
+                buf = self._class_features[c]
 
-                    idx = np.random.randint(0, len(self._class_features[c]))
-                    if np.random.random() < 1000 / (len(self._class_features[c]) + 1):
-                        self._class_features[c][idx] = features[i]
+                if len(buf) < 1000:
+                    buf.append(features[i])
+                else:
+                    # Algorithm R reservoir sampling: the k-th item seen so
+                    # far (1-indexed) replaces a uniformly random slot with
+                    # probability capacity/k, giving each seen item equal
+                    # probability of ending up in the final sample.
+                    j = np.random.randint(0, self._class_seen[c])
+                    if j < len(buf):
+                        buf[j] = features[i]
 
     def collect(self) -> SignalSnapshot:
 
@@ -118,7 +126,7 @@ class NeuralCollapseCollector(SignalCollector):
         self._compute_class_means()
 
         if self._class_means is None or self._global_mean is None:
-            return SignalSnapshot(signals=signals, overhead_ms=0)
+            return self._snapshot(signals)
 
         nc1 = self._compute_nc1()
         signals["nc"]["NC1_within_class_var"] = nc1
@@ -134,7 +142,18 @@ class NeuralCollapseCollector(SignalCollector):
 
         signals["nc"]["collapse_score"] = self._compute_collapse_score(nc1, nc2, nc3, nc4)
 
-        return SignalSnapshot(signals=signals, overhead_ms=0)
+        return self._snapshot(signals)
+
+    def _register_hooks(self) -> None:
+        # attach() registers the penultimate-layer feature hook itself.
+        pass
+
+    def _collect_signals(self) -> Dict[str, Any]:
+        return self.collect().signals
+
+    def _snapshot(self, signals: Dict[str, Any]) -> SignalSnapshot:
+        return SignalSnapshot(step=self._step, epoch=self._epoch, timestamp=time.time(),
+                              signals=signals, metadata=self._get_metadata())
 
     def _compute_class_means(self) -> None:
 
@@ -277,6 +296,7 @@ class NeuralCollapseCollector(SignalCollector):
 
         super().reset()
         self._class_features = {i: [] for i in range(self.num_classes)}
+        self._class_seen = {i: 0 for i in range(self.num_classes)}
         self._class_means = None
         self._global_mean = None
 

@@ -22,10 +22,20 @@ from arc.core.self_healing import (
     HealingAction,
     make_uncrashable,
 )
+from arc.core.controller import (
+    Controller,
+    ControllerConfig,
+    StepAction,
+    HealthStatus,
+)
 
 __all__ = [
     "SelfHealingArc",
     "SelfHealingConfig",
     "HealingAction",
     "make_uncrashable",
+    "Controller",
+    "ControllerConfig",
+    "StepAction",
+    "HealthStatus",
 ]

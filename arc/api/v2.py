@@ -19,7 +19,6 @@
 from typing import Dict, Any, Optional, Union, List, Callable
 import torch
 import torch.nn as nn
-import pickle
 import warnings
 
 from arc.config import Config, SignalConfig, FeatureConfig
@@ -30,6 +29,7 @@ except ImportError:
     ElasticWeightConsolidation = None
 from arc.uncertainty.conformal import ConformalPredictor, ConformalRegression
 from arc.security.adversarial import AdversarialDetector, AdversarialTrainer
+from arc._logging import log as _log
 
 class ArcV2(Arc):
     def __init__(
@@ -109,11 +109,11 @@ class ArcV2(Arc):
         instance._task_type = task_type
 
         if instance.verbose:
-            print(f"   ARC v2.0 Auto-configured:")
-            print(f"   Model: {n_params:,} params, {n_layers} layers")
-            print(f"   Task: {task_type}")
-            print(f"   Safety: {safety_level}")
-            print(f"   Features: EWC={continual}, UQ={uncertainty}, Adv={adversarial}")
+            _log(f"   ARC v2.0 Auto-configured:")
+            _log(f"   Model: {n_params:,} params, {n_layers} layers")
+            _log(f"   Task: {task_type}")
+            _log(f"   Safety: {safety_level}")
+            _log(f"   Features: EWC={continual}, UQ={uncertainty}, Adv={adversarial}")
 
         return instance
 
@@ -123,6 +123,18 @@ class ArcV2(Arc):
         x: Optional[torch.Tensor] = None,
         y: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
+        """Record one training step for monitoring/prediction.
+
+        This does not call `.backward()` or touch the optimizer, so it
+        cannot apply the EWC penalty to your loss for you. `result["ewc_penalty"]`
+        is informational only. If continual learning is enabled, add it to
+        your loss yourself *before* `.backward()`:
+
+            ewc_loss = arc.get_ewc_loss()
+            total_loss = loss + ewc_loss
+            total_loss.backward()
+            arc.step(total_loss)
+        """
         if isinstance(loss, torch.Tensor):
             loss = loss.item()
 
@@ -187,7 +199,7 @@ class ArcV2(Arc):
         self._task_count += 1
 
         if self.verbose:
-            print(f"Beginning task: {task_id} (Task #{self._task_count})")
+            _log(f"Beginning task: {task_id} (Task #{self._task_count})")
 
     def consolidate_task(
         self,
@@ -202,8 +214,8 @@ class ArcV2(Arc):
         self._ewc.consolidate_task(task_id, dataloader)
 
         if self.verbose:
-            print(f"   Consolidated task: {task_id}")
-            print(f"   Protected weights from {self._ewc.n_tasks} task(s)")
+            _log(f"   Consolidated task: {task_id}")
+            _log(f"   Protected weights from {self._ewc.n_tasks} task(s)")
 
     def get_ewc_loss(self) -> torch.Tensor:
         if self._ewc is None or self._ewc.n_tasks == 0:
@@ -265,7 +277,7 @@ class ArcV2(Arc):
         self._adversarial_detector.fit(dataloader, n_samples)
 
         if self.verbose:
-            print("Adversarial detector fitted")
+            _log("Adversarial detector fitted")
 
     def check_adversarial(self, x: torch.Tensor) -> Dict[str, Any]:
         if self._adversarial_detector is None:
@@ -315,7 +327,8 @@ class ArcV2(Arc):
             with open(os.path.join(path, "ewc_meta.json"), 'w') as f:
                 json.dump({"n_tasks": self._ewc.n_tasks}, f)
 
-    def load(self, path: str, model: Optional[nn.Module] = None) -> None:
+    def load(self, path: str, model: Optional[nn.Module] = None,
+             allow_unsafe: bool = False) -> None:
         """Restore ArcV2 state including EWC continual-learning data.
 
         Parameters
@@ -325,8 +338,12 @@ class ArcV2(Arc):
         model : nn.Module, optional
             If provided, the model is re-attached before restoring EWC
             state (required if a fresh ArcV2 instance was created).
+        allow_unsafe : bool
+            Permit ``weights_only=False`` unpickling (can execute code).
+            Only for files you produced yourself.
         """
         import os
+        from arc._serialization import safe_torch_load
 
         self.load_state(path)
 
@@ -346,32 +363,12 @@ class ArcV2(Arc):
                     except StopIteration:
                         pass
 
-                try:
-                    state = torch.load(ewc_path, map_location=device, weights_only=True)
-                except TypeError:
-                    state = torch.load(ewc_path, map_location=device)
-                except (pickle.UnpicklingError, RuntimeError) as exc:
-                    msg = str(exc).lower()
-                    looks_like_weights_only_rejection = (
-                        isinstance(exc, pickle.UnpicklingError)
-                        or "weights only" in msg
-                        or "unsupported global" in msg
-                        or "weightsunpicklererror" in msg
-                    )
-                    if not looks_like_weights_only_rejection:
-                        raise
-                    warnings.warn(
-                        f"Loading {ewc_path} with weights_only=False. "
-                        "Only do this for checkpoints you produced yourself. "
-                        "See SECURITY.md for the checkpoint trust boundary.",
-                        stacklevel=2,
-                    )
-                    state = torch.load(ewc_path, map_location=device, weights_only=False)
+                state = safe_torch_load(ewc_path, map_location=device, allow_unsafe=allow_unsafe)
 
                 self._ewc.load_state_dict(state, device=device)
 
                 if self.verbose:
-                    print(f"   Restored EWC state: {self._ewc.n_tasks} task(s)")
+                    _log(f"   Restored EWC state: {self._ewc.n_tasks} task(s)")
 
     def __repr__(self) -> str:
         features = []

@@ -16,19 +16,39 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with ARC. If not, see <https://www.gnu.org/licenses/>.
 
+"""Classify hardware/runtime errors and recover only where recovery is real.
+
+What can and can't be fixed in-process:
+
+- Most CUDA errors (illegal memory access, device-side assert, launch
+  failures) leave the CUDA context unusable for the rest of the process.
+  Nothing in Python can reset it. These are reported as *not* recovered with
+  "restart the process and resume from the last checkpoint".
+- An NCCL/collective failure is recovered only if a barrier across all ranks
+  actually succeeds afterwards; ARC never claims to "continue with the
+  remaining ranks" (NCCL communicators can't do that).
+- Disk-full is recovered only by deleting ARC's *own* old checkpoint files.
+- Moving training to the CPU or to another GPU is opt-in, never automatic.
+"""
+
+import functools
+import glob
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from datetime import timedelta
+from enum import Enum, auto
+from typing import Optional, Dict, Any, Callable
+
 import torch
 import torch.nn as nn
-import os
-import sys
-import time
-import traceback
-from datetime import timedelta
-from typing import Optional, Dict, Any, Callable, List, Tuple, Union
-from dataclasses import dataclass, field
+
 from arc.config import default_checkpoint_dir
-from enum import Enum, auto
-import warnings
-import functools
+from arc._logging import log
+
+RESTART = "restart the process and resume from the last durable checkpoint"
+
 
 class HardwareErrorType(Enum):
     CUDA_ERROR = auto()
@@ -40,26 +60,31 @@ class HardwareErrorType(Enum):
     DRIVER_ERROR = auto()
     DEVICE_TIMEOUT = auto()
 
+
 @dataclass
 class HardwareConfig:
     max_retries: int = 3
     retry_delay_seconds: float = 1.0
     exponential_backoff: bool = True
 
-    allow_cpu_fallback: bool = True
-    allow_device_switch: bool = True
+    # Opt-in: silently continuing a GPU run on the CPU (10-100x slower) or
+    # on another GPU is a decision for the user, not for ARC.
+    allow_cpu_fallback: bool = False
+    allow_device_switch: bool = False
 
     checkpoint_to_disk_on_oom: bool = True
+    # Disk-full recovery deletes old ARC checkpoints (checkpoint_*.pt) here,
+    # keeping the newest `keep_checkpoints`. Nothing else is ever deleted.
     checkpoint_dir: str = default_checkpoint_dir("checkpoints")
-    remote_checkpoint_url: Optional[str] = None
+    keep_checkpoints: int = 2
 
     ddp_timeout_seconds: float = 300.0
-    isolate_failed_ranks: bool = True
 
     monitor_gpu_health: bool = True
     health_check_interval: int = 100
 
     verbose: bool = True
+
 
 @dataclass
 class HardwareRecoveryResult:
@@ -68,6 +93,7 @@ class HardwareRecoveryResult:
     recovery_action: str = ""
     new_device: Optional[torch.device] = None
     details: Dict[str, Any] = field(default_factory=dict)
+
 
 class HardwareRecoveryHandler:
     def __init__(
@@ -94,10 +120,11 @@ class HardwareRecoveryHandler:
         if self.config.checkpoint_to_disk_on_oom:
             os.makedirs(self.config.checkpoint_dir, exist_ok=True)
 
+        self._log(f"HardwareRecoveryHandler on {self.original_device}")
+
+    def _log(self, message: str, level: int = logging.INFO) -> None:
         if self.config.verbose:
-            print(f" HardwareRecoveryHandler initialized")
-            print(f"   Primary device: {self.original_device}")
-            print(f"   Fallback device: {self.fallback_device}")
+            log(message, level)
 
     def classify_error(self, error: Exception) -> Optional[HardwareErrorType]:
         error_str = str(error).lower()
@@ -137,148 +164,105 @@ class HardwareRecoveryHandler:
             )
 
         self.error_count[error_type] += 1
+        self._log(f"hardware error: {error_type.name}: {error}", logging.WARNING)
 
-        if self.config.verbose:
-            print(f"Hardware error detected: {error_type.name}")
-
-        if error_type == HardwareErrorType.CUDA_ERROR:
-            return self._recover_cuda_error()
-        elif error_type == HardwareErrorType.GPU_MEMORY_CORRUPTION:
-            return self._recover_memory_corruption()
-        elif error_type == HardwareErrorType.GPU_UNAVAILABLE:
-            return self._recover_gpu_unavailable()
-        elif error_type == HardwareErrorType.DISK_FULL:
-            return self._recover_disk_full()
-        elif error_type == HardwareErrorType.NETWORK_FAILURE:
-            return self._recover_network_failure()
-        elif error_type == HardwareErrorType.DDP_COMMUNICATION_FAILURE:
-            return self._recover_ddp_failure()
-        elif error_type == HardwareErrorType.DRIVER_ERROR:
-            return self._recover_driver_error()
-
-        return HardwareRecoveryResult(
-            success=False,
-            error_type=error_type,
-            details={"reason": "No recovery handler for this error type"}
-        )
+        handlers = {
+            HardwareErrorType.CUDA_ERROR: self._recover_cuda_error,
+            HardwareErrorType.GPU_MEMORY_CORRUPTION: self._recover_cuda_error,
+            HardwareErrorType.DRIVER_ERROR: self._recover_driver_error,
+            HardwareErrorType.GPU_UNAVAILABLE: self._recover_gpu_unavailable,
+            HardwareErrorType.DISK_FULL: self._recover_disk_full,
+            HardwareErrorType.NETWORK_FAILURE: self._recover_network_failure,
+            HardwareErrorType.DDP_COMMUNICATION_FAILURE: self._recover_ddp_failure,
+        }
+        handler = handlers.get(error_type)
+        if handler is None:
+            return HardwareRecoveryResult(
+                success=False, error_type=error_type,
+                recovery_action=RESTART,
+                details={"reason": "No in-process recovery exists for this error"},
+            )
+        result = handler()
+        result.error_type = error_type
+        if result.success:
+            self.recovery_count += 1
+        return result
 
     def _recover_cuda_error(self) -> HardwareRecoveryResult:
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-
-            if self.error_count[HardwareErrorType.CUDA_ERROR] >= self.config.max_retries:
-                if self.config.allow_cpu_fallback:
-                    return self._fallback_to_cpu()
-
-            self.recovery_count += 1
-            return HardwareRecoveryResult(
-                success=True,
-                error_type=HardwareErrorType.CUDA_ERROR,
-                recovery_action="Reset CUDA context",
-            )
-        except Exception as e:
-            return self._fallback_to_cpu() if self.config.allow_cpu_fallback else                   HardwareRecoveryResult(success=False, details={"error": str(e)})
-
-    def _recover_memory_corruption(self) -> HardwareRecoveryResult:
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-
-                self.model.to(self.current_device)
-
-            self.recovery_count += 1
-            return HardwareRecoveryResult(
-                success=True,
-                error_type=HardwareErrorType.GPU_MEMORY_CORRUPTION,
-                recovery_action="Cleared GPU memory and reinitialized",
-            )
-        except Exception:
-            return self._fallback_to_cpu()
-
-    def _recover_gpu_unavailable(self) -> HardwareRecoveryResult:
-        if self.config.allow_device_switch and torch.cuda.device_count() > 1:
-            for i in range(torch.cuda.device_count()):
-                device = torch.device(f"cuda:{i}")
-                if device != self.current_device:
-                    try:
-                        self.model.to(device)
-                        self.current_device = device
-                        self.recovery_count += 1
-
-                        if self.config.verbose:
-                            print(f"   Switched to GPU {i}")
-
-                        return HardwareRecoveryResult(
-                            success=True,
-                            error_type=HardwareErrorType.GPU_UNAVAILABLE,
-                            recovery_action=f"Switched to GPU {i}",
-                            new_device=device,
-                        )
-                    except Exception:
-                        continue
-
-        return self._fallback_to_cpu()
-
-    def _recover_disk_full(self) -> HardwareRecoveryResult:
-        try:
-            if os.path.exists(self.config.checkpoint_dir):
-                files = sorted([
-                    os.path.join(self.config.checkpoint_dir, f)
-                    for f in os.listdir(self.config.checkpoint_dir)
-                    if f.endswith('.pt') or f.endswith('.pth')
-                ], key=os.path.getmtime)
-
-                removed = 0
-                for f in files[:-2]:
-                    try:
-                        os.remove(f)
-                        removed += 1
-                    except Exception:
-                        pass
-
-                if removed > 0:
-                    self.recovery_count += 1
-                    return HardwareRecoveryResult(
-                        success=True,
-                        error_type=HardwareErrorType.DISK_FULL,
-                        recovery_action=f"Removed {removed} old checkpoints",
-                        details={"removed_count": removed}
-                    )
-        except Exception as e:
-            pass
-
-        if self.config.remote_checkpoint_url:
-            return HardwareRecoveryResult(
-                success=True,
-                error_type=HardwareErrorType.DISK_FULL,
-                recovery_action="Switching to remote checkpoint storage",
-                details={"remote_url": self.config.remote_checkpoint_url}
-            )
-
+        # A CUDA error poisons the process's CUDA context; every later CUDA
+        # call fails too. empty_cache()/synchronize() can't undo that.
         return HardwareRecoveryResult(
             success=False,
-            error_type=HardwareErrorType.DISK_FULL,
-            details={"reason": "Could not free disk space"}
+            recovery_action=f"CUDA context is unusable after this error: {RESTART}",
+        )
+
+    def _recover_driver_error(self) -> HardwareRecoveryResult:
+        if self.config.allow_cpu_fallback:
+            return self._fallback_to_cpu()
+        return HardwareRecoveryResult(success=False, recovery_action=f"GPU driver error: {RESTART}")
+
+    def _recover_gpu_unavailable(self) -> HardwareRecoveryResult:
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        if self.config.allow_device_switch and not distributed and torch.cuda.device_count() > 1:
+            for i in range(torch.cuda.device_count()):
+                device = torch.device(f"cuda:{i}")
+                if device == self.current_device:
+                    continue
+                try:
+                    self._move_training_state(device)
+                except RuntimeError:
+                    continue
+                return HardwareRecoveryResult(
+                    success=True, recovery_action=f"Moved model and optimizer to {device}",
+                    new_device=device,
+                )
+        if self.config.allow_cpu_fallback:
+            return self._fallback_to_cpu()
+        return HardwareRecoveryResult(success=False, recovery_action=f"GPU unavailable: {RESTART}")
+
+    def _recover_disk_full(self) -> HardwareRecoveryResult:
+        files = sorted(glob.glob(os.path.join(self.config.checkpoint_dir, "checkpoint_*.pt")),
+                       key=os.path.getmtime)
+        stale = files[:max(0, len(files) - self.config.keep_checkpoints)]
+        removed = 0
+        for path in stale:
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+
+        if removed:
+            return HardwareRecoveryResult(
+                success=True,
+                recovery_action=f"Removed {removed} old ARC checkpoints",
+                details={"removed_count": removed},
+            )
+        return HardwareRecoveryResult(
+            success=False,
+            recovery_action="No old ARC checkpoints to delete; free disk space and resume",
         )
 
     def _recover_network_failure(self) -> HardwareRecoveryResult:
         delay = self.config.retry_delay_seconds
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+
+        if not distributed:
+            # Nothing to re-check: back off once, then skip the failed step.
+            time.sleep(delay)
+            return HardwareRecoveryResult(
+                success=True,
+                recovery_action=f"Backed off {delay:.1f}s after a transient network error; "
+                                "the failed step was skipped",
+            )
 
         for attempt in range(self.config.max_retries):
             time.sleep(delay)
-
             try:
-                if torch.distributed.is_initialized():
-                    torch.distributed.barrier(timeout=timedelta(seconds=10))
-
-                self.recovery_count += 1
+                torch.distributed.barrier(timeout=timedelta(seconds=10))
                 return HardwareRecoveryResult(
                     success=True,
-                    error_type=HardwareErrorType.NETWORK_FAILURE,
-                    recovery_action=f"Network recovered after {attempt + 1} retries",
+                    recovery_action=f"All ranks reached a barrier after {attempt + 1} attempt(s)",
                 )
             except Exception:
                 if self.config.exponential_backoff:
@@ -286,101 +270,61 @@ class HardwareRecoveryHandler:
 
         return HardwareRecoveryResult(
             success=False,
-            error_type=HardwareErrorType.NETWORK_FAILURE,
-            details={"reason": "Network did not recover after max retries"}
+            recovery_action=f"Network did not recover: {RESTART}",
         )
 
     def _recover_ddp_failure(self) -> HardwareRecoveryResult:
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return HardwareRecoveryResult(
+                success=False, recovery_action="No process group is initialized; nothing to resync",
+            )
         try:
-            if torch.distributed.is_initialized():
-                try:
-                    torch.distributed.barrier(
-                        timeout=timedelta(seconds=self.config.ddp_timeout_seconds)
-                    )
-                except Exception:
-                    if self.config.isolate_failed_ranks:
-                        warnings.warn("DDP ranks out of sync, continuing with available ranks")
-
-                self.recovery_count += 1
-                return HardwareRecoveryResult(
-                    success=True,
-                    error_type=HardwareErrorType.DDP_COMMUNICATION_FAILURE,
-                    recovery_action="DDP barrier recovered",
-                )
+            torch.distributed.barrier(timeout=timedelta(seconds=self.config.ddp_timeout_seconds))
         except Exception as e:
-            pass
+            return HardwareRecoveryResult(
+                success=False,
+                recovery_action=f"Ranks could not resynchronize ({e}); relaunch with an elastic "
+                                f"launcher (torchrun --max-restarts) and resume from the last checkpoint",
+            )
+        return HardwareRecoveryResult(success=True, recovery_action="All ranks resynchronized")
 
-        return self._fallback_to_single_device()
-
-    def _recover_driver_error(self) -> HardwareRecoveryResult:
-        return self._fallback_to_cpu()
+    def _move_training_state(self, device: torch.device) -> None:
+        self.model.to(device)
+        for state in self.optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor) and v.dim() > 0:
+                    state[k] = v.to(device)
+        self.current_device = device
 
     def _fallback_to_cpu(self) -> HardwareRecoveryResult:
-        if not self.config.allow_cpu_fallback:
-            return HardwareRecoveryResult(
-                success=False,
-                details={"reason": "CPU fallback not allowed"}
-            )
-
         try:
-            self.model.cpu()
-            self.current_device = torch.device("cpu")
-
-            for state in self.optimizer.state.values():
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor):
-                        state[k] = v.cpu()
-
-            self.recovery_count += 1
-
-            if self.config.verbose:
-                print("   Fell back to CPU execution")
-
-            return HardwareRecoveryResult(
-                success=True,
-                recovery_action="Fell back to CPU",
-                new_device=torch.device("cpu"),
-            )
+            self._move_training_state(self.fallback_device)
         except Exception as e:
             return HardwareRecoveryResult(
                 success=False,
-                details={"reason": f"CPU fallback failed: {e}"}
+                recovery_action=f"CPU fallback failed ({e}): {RESTART}",
             )
-
-    def _fallback_to_single_device(self) -> HardwareRecoveryResult:
-        try:
-            if hasattr(self.model, 'module'):
-                self.model = self.model.module
-
-            self.recovery_count += 1
-
-            if self.config.verbose:
-                print("   Fell back to single device (DDP disabled)")
-
-            return HardwareRecoveryResult(
-                success=True,
-                recovery_action="Disabled DDP, continuing on single device",
-            )
-        except Exception as e:
-            return HardwareRecoveryResult(
-                success=False,
-                details={"reason": f"Single device fallback failed: {e}"}
-            )
+        self._log("fell back to CPU execution (expect a large slowdown)", logging.WARNING)
+        return HardwareRecoveryResult(
+            success=True,
+            recovery_action="Moved model and optimizer to CPU",
+            new_device=self.fallback_device,
+        )
 
     def check_gpu_health(self) -> bool:
         if not torch.cuda.is_available():
+            self._gpu_healthy = True
             return True
 
         try:
             torch.cuda.synchronize()
-
-            free_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
-            if free_memory < 100 * 1024 * 1024:
-                warnings.warn("GPU memory critically low")
-                return False
-
-            return True
+            free_bytes, _ = torch.cuda.mem_get_info()
+            self._gpu_healthy = free_bytes >= 100 * 1024 * 1024
+            if not self._gpu_healthy:
+                self._log("GPU memory critically low", logging.WARNING)
+            return self._gpu_healthy
         except Exception:
+            self._gpu_healthy = False
             return False
 
     def safe_context(self):
@@ -395,6 +339,7 @@ class HardwareRecoveryHandler:
             "gpu_healthy": self._gpu_healthy,
         }
 
+
 class SafeHardwareContext:
 
     def __init__(self, handler: HardwareRecoveryHandler):
@@ -404,35 +349,30 @@ class SafeHardwareContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_val is not None:
-            error_type = self.handler.classify_error(exc_val)
-            if error_type is not None:
-                result = self.handler.try_recover(exc_val)
-                if result.success:
-                    return True
+        if exc_val is not None and self.handler.classify_error(exc_val) is not None:
+            return self.handler.try_recover(exc_val).success
         return False
 
+
 def hardware_safe(func: Callable) -> Callable:
+    """Retry `func` on transient device errors (not on sticky CUDA errors,
+    which no retry can fix)."""
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         max_retries = 3
-
         for attempt in range(max_retries):
             try:
                 return func(*args, **kwargs)
             except RuntimeError as e:
                 error_str = str(e).lower()
-                if 'cuda' in error_str or 'device' in error_str:
-                    if attempt < max_retries - 1:
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        time.sleep(1)
-                        continue
+                transient = 'timeout' in error_str or 'temporarily unavailable' in error_str
+                if transient and attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
                 raise
 
-        raise RuntimeError(f"Hardware error in {func.__name__} after {max_retries} retries")
-
     return wrapper
+
 
 def get_best_device() -> torch.device:
     if torch.cuda.is_available():
@@ -441,6 +381,7 @@ def get_best_device() -> torch.device:
         return torch.device("mps")
     else:
         return torch.device("cpu")
+
 
 def get_device_info() -> Dict[str, Any]:
     info = {

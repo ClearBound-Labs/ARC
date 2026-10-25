@@ -80,7 +80,7 @@ In your PR, include:
 
 ## PR Standards
 
-- Keep PRs focused — avoid unrelated changes
+- Keep PRs focused; leave out unrelated changes
 - Ensure code runs correctly before submitting
 - Maintain compatibility with the existing architecture
 - Discuss major architectural changes in an issue before implementing

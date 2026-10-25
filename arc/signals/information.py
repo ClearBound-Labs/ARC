@@ -17,6 +17,8 @@
 # along with ARC. If not, see <https://www.gnu.org/licenses/>.
 
 from typing import Dict, Any, Optional, List, Tuple
+import time
+import warnings
 import numpy as np
 import torch
 import torch.nn as nn
@@ -195,7 +197,8 @@ class InformationDynamicsCollector(SignalCollector):
             mi = h_y - h_y_given_t
             return float(max(0, mi))
 
-        except Exception:
+        except Exception as e:
+            warnings.warn(f"Mutual information computation failed, using fallback estimate: {e}")
             return float(h_y * 0.5)
 
     def get_information_plane_trajectory(self) -> List[Dict[str, Tuple[float, float]]]:
@@ -221,6 +224,15 @@ class InformationDynamicsCollector(SignalCollector):
 
         return False
 
+    def _register_hooks(self) -> None:
+        # No-op: attach() is overridden above to register this collector's
+        # own forward hooks directly (activation capture needs layer-name
+        # closures), bypassing the base class's default hook registration.
+        pass
+
+    def _collect_signals(self) -> Dict[str, Any]:
+        return self.compute_information_metrics()
+
     def collect(self) -> SignalSnapshot:
 
         metrics = self.compute_information_metrics()
@@ -240,7 +252,13 @@ class InformationDynamicsCollector(SignalCollector):
         if self._mi_hidden_output:
             signals["information"]["mean_mi_t_y"] = np.mean(list(self._mi_hidden_output.values()))
 
-        return SignalSnapshot(signals=signals, overhead_ms=0)
+        return SignalSnapshot(
+            step=self._step,
+            epoch=self._epoch,
+            timestamp=time.time(),
+            signals=signals,
+            metadata=self._get_metadata(),
+        )
 
     def reset(self) -> None:
 

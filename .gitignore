@@ -65,3 +65,12 @@ tmp_*/
 # Build artifacts
 arc_training-*/
 .venv/
+.pytest_cache/
+
+# Local-only material (never published)
+_private/
+paper/
+notebooks/
+results/
+*.ipynb
+.claude/

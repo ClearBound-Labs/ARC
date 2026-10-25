@@ -62,23 +62,23 @@ class TrajectoryLabeler:
 
         div_result = self._check_divergence(signals)
         if div_result[0]:
-            candidates.append((FailureMode.DIVERGENCE, *div_result))
+            candidates.append((FailureMode.DIVERGENCE, *div_result[2:]))
 
         van_result = self._check_vanishing_gradients(signals)
         if van_result[0]:
-            candidates.append((FailureMode.VANISHING_GRADIENTS, *van_result))
+            candidates.append((FailureMode.VANISHING_GRADIENTS, *van_result[2:]))
 
         exp_result = self._check_exploding_gradients(signals)
         if exp_result[0]:
-            candidates.append((FailureMode.EXPLODING_GRADIENTS, *exp_result))
+            candidates.append((FailureMode.EXPLODING_GRADIENTS, *exp_result[2:]))
 
         col_result = self._check_representation_collapse(signals)
         if col_result[0]:
-            candidates.append((FailureMode.REPRESENTATION_COLLAPSE, *col_result))
+            candidates.append((FailureMode.REPRESENTATION_COLLAPSE, *col_result[2:]))
 
         ovf_result = self._check_overfitting(signals)
         if ovf_result[0]:
-            candidates.append((FailureMode.SEVERE_OVERFITTING, *ovf_result))
+            candidates.append((FailureMode.SEVERE_OVERFITTING, *ovf_result[2:]))
 
         if not candidates:
             return FailureLabel(
@@ -88,14 +88,15 @@ class TrajectoryLabeler:
                 evidence={"status": "no_failure_detected"}
             )
 
-        candidates.sort(key=lambda x: (x[2], -x[3]))
+        # each candidate is now (mode, failure_epoch, confidence, evidence)
+        candidates.sort(key=lambda x: -x[2])
 
         best = candidates[0]
         return FailureLabel(
             mode=best[0],
-            failure_epoch=best[2],
-            confidence=best[3],
-            evidence=best[4],
+            failure_epoch=best[1],
+            confidence=best[2],
+            evidence=best[3],
         )
 
     def _check_divergence(

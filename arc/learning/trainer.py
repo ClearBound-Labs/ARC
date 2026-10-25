@@ -18,8 +18,6 @@
 
 from typing import Dict, Any, Optional, List, Tuple, Callable
 from dataclasses import dataclass
-import pickle
-import warnings
 import os
 import json
 import numpy as np
@@ -34,6 +32,7 @@ from arc.learning.simulator import SimulatedTrajectory
 from arc.learning.labeler import TrajectoryLabeler, FailureLabel
 from arc.features.extractor import FeatureExtractor
 from arc.features.normalizer import OnlineNormalizer
+from arc._logging import log as _log
 
 class TrajectoryDataset(Dataset):
 
@@ -242,7 +241,7 @@ class MetaModelTrainer:
                 else:
                     self.patience_counter += 1
                     if self.patience_counter >= patience:
-                        print(f"Early stopping at epoch {epoch}")
+                        _log(f"Early stopping at epoch {epoch}")
                         break
 
         return self.metrics_history
@@ -350,33 +349,10 @@ class MetaModelTrainer:
         filename = "best_model.pt" if best else f"checkpoint_epoch_{epoch}.pt"
         torch.save(checkpoint, os.path.join(checkpoint_dir, filename))
 
-    def load_checkpoint(self, path: str) -> None:
-        try:
-            checkpoint = torch.load(path, map_location=self.device, weights_only=True)
-        except TypeError:
-            # PyTorch <1.13 doesn't support weights_only; fall back transparently
-            checkpoint = torch.load(path, map_location=self.device)
-        except (pickle.UnpicklingError, RuntimeError) as exc:
-            # Discriminate: pickle.UnpicklingError is always a weights_only rejection;
-            # RuntimeError is only a weights_only rejection if the message says so.
-            # Other RuntimeErrors (file corruption, device mismatch, missing keys, I/O)
-            # must propagate rather than silently fall back to the unsafe path.
-            msg = str(exc).lower()
-            looks_like_weights_only_rejection = (
-                isinstance(exc, pickle.UnpicklingError)
-                or "weights only" in msg
-                or "unsupported global" in msg
-                or "weightsunpicklererror" in msg
-            )
-            if not looks_like_weights_only_rejection:
-                raise
-            warnings.warn(
-                f"Loading {path} with weights_only=False. "
-                "Only do this for checkpoints you produced yourself. "
-                "See SECURITY.md for the checkpoint trust boundary.",
-                stacklevel=2,
-            )
-            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+    def load_checkpoint(self, path: str, allow_unsafe: bool = False) -> None:
+        from arc._serialization import safe_torch_load
+
+        checkpoint = safe_torch_load(path, map_location=self.device, allow_unsafe=allow_unsafe)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 

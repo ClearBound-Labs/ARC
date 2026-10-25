@@ -24,10 +24,20 @@ from dataclasses import dataclass
 from arc.config import default_checkpoint_dir
 import os
 import warnings
+from arc._logging import log as _log
 
 @dataclass
 class DDPConfig:
-    sync_frequency: int = 10
+    # Default 1 (every step), not a larger interval: DistributedDataParallel
+    # all-reduces gradients on every backward pass regardless of this setting,
+    # so a NaN on one rank contaminates every rank's gradients immediately.
+    # A larger sync_frequency here only delays *this* class's detection/rollback
+    # after that contamination has already happened -- it doesn't prevent it.
+    # The failure-sync itself is a single-element all_reduce, negligible next
+    # to the gradient all-reduce DDP already performs every step, so there's
+    # no real perf reason to raise this above 1. Left configurable for users
+    # who explicitly want to trade detection latency for less sync overhead.
+    sync_frequency: int = 1
     use_all_reduce: bool = True
 
     coordinator_rank: int = 0
@@ -72,11 +82,22 @@ class DDPRollback:
         self._step_count = 0
         self._rollback_count = 0
 
+        if self.config.sync_frequency > 1:
+            warnings.warn(
+                f"DDPRollback sync_frequency={self.config.sync_frequency} > 1: "
+                "a NaN/exploded gradient on one rank propagates to all ranks via "
+                "DDP's own per-step gradient all-reduce immediately, but this "
+                "class's failure detection and rollback won't run until the next "
+                "sync boundary (up to sync_frequency - 1 steps later). Only raise "
+                "this above 1 if you've deliberately accepted that detection lag.",
+                stacklevel=2,
+            )
+
         if self.is_coordinator and self.config.save_to_disk:
             os.makedirs(self.config.checkpoint_dir, exist_ok=True)
 
         if verbose and self.is_coordinator:
-            print(f" DDPRollback: Initialized across {self.world_size} ranks")
+            _log(f" DDPRollback: Initialized across {self.world_size} ranks")
 
     def _detect_any_failure(self, loss: torch.Tensor) -> bool:
         local_failure = self._local_rollback._detect_failure(loss)
@@ -99,7 +120,7 @@ class DDPRollback:
         self._rollback_count += 1
 
         if self.verbose and self.is_coordinator:
-            print(f" DDP Rollback #{self._rollback_count}: All {self.world_size} ranks restored")
+            _log(f" DDP Rollback #{self._rollback_count}: All {self.world_size} ranks restored")
 
         return steps_back
 
@@ -188,7 +209,7 @@ def example_ddp_training():
         optimizer.zero_grad()
 
     if local_rank == 0:
-        print(f"Training complete: {rollback.get_stats()}")
+        _log(f"Training complete: {rollback.get_stats()}")
 
     dist.destroy_process_group()
 

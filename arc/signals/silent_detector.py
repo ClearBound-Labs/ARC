@@ -25,6 +25,9 @@ from collections import deque
 from enum import Enum, auto
 import warnings
 
+from arc.signals.stats_utils import ols_slope
+from arc._logging import log as _log
+
 class SilentFailureType(Enum):
 
     ACCURACY_COLLAPSE = auto()
@@ -54,7 +57,13 @@ class SilentDetectorConfig:
     dead_neuron_threshold: float = 0.01
     representation_similarity_threshold: float = 0.99
     gradient_death_threshold: float = 1e-8
-    loss_plateau_epochs: int = 10
+    # Patience in `check()` calls (i.e. training steps), not epochs -- this
+    # class has no epoch-boundary information, so it can't convert an
+    # epoch count into steps without assuming a fixed steps-per-epoch (the
+    # previous `loss_plateau_epochs * 100` did exactly that and silently
+    # misfired for any run that wasn't ~100 steps/epoch). Default of 1000
+    # matches the old default of 10 epochs * 100 steps/epoch.
+    loss_plateau_patience_steps: int = 1000
     loss_plateau_threshold: float = 0.001
     overfit_gap_threshold: float = 2.0
 
@@ -110,9 +119,7 @@ class MetricTracker:
         if len(self.history) < window:
             return 0.0
         recent = list(self.history)[-window:]
-        x = np.arange(len(recent))
-        slope, _ = np.polyfit(x, recent, 1)
-        return slope
+        return ols_slope(recent)
 
     def detect_anomaly(self, current: float, sigma_threshold: float = 3.0) -> bool:
 
@@ -140,6 +147,15 @@ class SilentCrashDetector:
 
         self._activation_stats: Dict[str, Dict[str, float]] = {}
         self._representation_buffer: Deque[torch.Tensor] = deque(maxlen=10)
+
+        # Fixed reference point for accuracy-collapse detection, captured once
+        # from the first `smoothing_window` accuracy values. Deliberately not
+        # re-derived from accuracy_tracker.history[:smoothing_window] on every
+        # check -- that deque has maxlen=history_size, so once more than
+        # history_size updates occur the "first N" entries silently become
+        # "N entries starting ~history_size steps ago" and the baseline drifts
+        # along with a slow collapse, making long-horizon collapse invisible.
+        self._accuracy_baseline: Optional[float] = None
 
     def check(
         self,
@@ -215,8 +231,8 @@ class SilentCrashDetector:
             self.detection_history.append(result)
 
             if self.config.verbose:
-                print(f"⚠️ Silent failure detected: {result.failure_type.name}")
-                print(f"   Severity: {result.severity:.2f}, {result.recommendation}")
+                _log(f"⚠️ Silent failure detected: {result.failure_type.name}")
+                _log(f"   Severity: {result.severity:.2f}, {result.recommendation}")
 
             return result
 
@@ -230,7 +246,11 @@ class SilentCrashDetector:
         loss_std = self.loss_tracker.std
         loss_stable = loss_std < 0.1 * abs(self.loss_tracker.mean + 1e-8)
 
-        baseline = np.mean(list(self.accuracy_tracker.history)[:self.config.smoothing_window])
+        if self._accuracy_baseline is None:
+            self._accuracy_baseline = float(np.mean(
+                list(self.accuracy_tracker.history)[:self.config.smoothing_window]
+            ))
+        baseline = self._accuracy_baseline
         recent = np.mean(list(self.accuracy_tracker.history)[-self.config.smoothing_window:])
         drop = baseline - recent
         drop_sigma = drop / (self.accuracy_tracker.std + 1e-8)
@@ -382,11 +402,12 @@ class SilentCrashDetector:
 
     def _check_loss_plateau(self) -> SilentFailureDetection:
 
-        if self.steps_without_improvement >= self.config.loss_plateau_epochs * 100:
+        patience = self.config.loss_plateau_patience_steps
+        if self.steps_without_improvement >= patience:
             return SilentFailureDetection(
                 detected=True,
                 failure_type=SilentFailureType.LOSS_PLATEAU,
-                severity=min(1.0, self.steps_without_improvement / (self.config.loss_plateau_epochs * 200)),
+                severity=min(1.0, self.steps_without_improvement / (patience * 2)),
                 details={
                     "steps_without_improvement": self.steps_without_improvement,
                     "best_loss": self.best_loss,
@@ -443,6 +464,7 @@ class SilentCrashDetector:
         self.best_loss = float('inf')
         self.steps_without_improvement = 0
         self.detection_history = []
+        self._accuracy_baseline = None
 
 class ActivationMonitor:
 

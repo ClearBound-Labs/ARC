@@ -1,372 +1,205 @@
-# ARC (Automatic Recovery Controller) - Self-Healing Neural Networks
-# Copyright (c) 2026 Aryan Kaushik. All rights reserved.
-#
-# This file is part of ARC.
-#
-# ARC is free software: you can redistribute it and/or modify it under the
-# terms of the GNU Affero General Public License as published by the Free
-# Software Foundation, either version 3 of the License, or (at your option)
-# any later version.
-#
-# ARC is distributed in the hope that it will be useful, but WITHOUT ANY
-# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-# FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for
-# more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with ARC. If not, see <https://www.gnu.org/licenses/>.
+"""Organic failure harness: failures caused by real training conditions,
+never by assigning nan/inf to the loss directly."""
+import io, sys, math, contextlib
+import torch, torch.nn as nn, torch.nn.functional as F
+from arc.core.controller import Controller, ControllerConfig
 
-"""
-ARC Organic Failure Test (Phase 2)
-
-Addresses reviewer concern: "Manually setting loss = NaN is a unit test, not a stress test"
-
-This module tests REAL failure scenarios:
-1. High LR without injection (natural explosion)
-2. Unstable architecture (deep vanilla RNN)
-3. Bad initialization (extreme weights)
-4. Pathological batch (outliers)
-5. No weight decay with high LR
-
-These are organic failures that occur in real training.
-"""
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
-import json
-import sys
-import os
-import time
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from arc.core.self_healing import SelfHealingArc, SelfHealingConfig
+torch.manual_seed(0)
+STEPS = 60
 
 
-# =============================================================================
-# Unstable Architectures
-# =============================================================================
-
-class DeepVanillaRNN(nn.Module):
-    """Deep vanilla RNN - known to be unstable (exploding/vanishing gradients)."""
-    def __init__(self, input_size=50, hidden_size=128, num_layers=10, output_size=10):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        
-        # Vanilla RNN layers (no LSTM/GRU stabilization)
-        self.rnn_layers = nn.ModuleList([
-            nn.RNNCell(input_size if i == 0 else hidden_size, hidden_size)
-            for i in range(num_layers)
-        ])
-        self.fc = nn.Linear(hidden_size, output_size)
-        self.n_params = sum(p.numel() for p in self.parameters())
-    
-    def forward(self, x):
-        # x: (batch, seq_len, input)
-        batch_size, seq_len, _ = x.shape
-        
-        # Initialize hidden states
-        hiddens = [torch.zeros(batch_size, self.hidden_size, device=x.device) 
-                   for _ in range(self.num_layers)]
-        
-        # Process sequence
-        for t in range(seq_len):
-            inp = x[:, t, :]
-            for i, rnn in enumerate(self.rnn_layers):
-                hiddens[i] = rnn(inp if i == 0 else hiddens[i-1], hiddens[i])
-        
-        return self.fc(hiddens[-1])
+def mlp(d_in=16, h=64, d_out=1, depth=3, init_gain=None):
+    layers, d = [], d_in
+    for _ in range(depth):
+        layers += [nn.Linear(d, h), nn.ReLU()]
+        d = h
+    layers += [nn.Linear(d, d_out)]
+    m = nn.Sequential(*layers)
+    if init_gain is not None:
+        for p in m.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p, gain=init_gain)
+    return m
 
 
-class VeryDeepMLP(nn.Module):
-    """Very deep MLP without skip connections - prone to gradient issues."""
-    def __init__(self, depth=20, width=128):
-        super().__init__()
-        layers = [nn.Linear(100, width), nn.ReLU()]
-        for _ in range(depth - 2):
-            layers.extend([nn.Linear(width, width), nn.ReLU()])
-        layers.append(nn.Linear(width, 10))
-        self.net = nn.Sequential(*layers)
-        self.n_params = sum(p.numel() for p in self.parameters())
-    
-    def forward(self, x):
-        return self.net(x)
+# ---- scenarios: return (model, optimizer, step_fn(model, step) -> loss) ----
+
+def sc_lr_too_high():
+    """Classic: learning rate orders of magnitude too high. Loss diverges."""
+    m = mlp()
+    opt = torch.optim.SGD(m.parameters(), lr=3.0)
+    x, y = torch.randn(64, 16), torch.randn(64, 1)
+    return m, opt, lambda m, s: F.mse_loss(m(x), y)
 
 
-class UnstableTransformer(nn.Module):
-    """Transformer with Post-Norm (less stable than Pre-Norm)."""
-    def __init__(self, d_model=128, nhead=4, num_layers=6):
-        super().__init__()
-        self.embed = nn.Linear(50, d_model)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, 
-            dim_feedforward=d_model*4,
-            dropout=0.0,  # No dropout = less regularization
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.fc = nn.Linear(d_model, 10)
-        self.n_params = sum(p.numel() for p in self.parameters())
-    
-    def forward(self, x):
-        x = self.embed(x)
-        x = self.transformer(x)
-        return self.fc(x.mean(dim=1))
+def sc_nan_in_data():
+    """Corrupt sensor row enters the dataset at step 20."""
+    m = mlp()
+    opt = torch.optim.Adam(m.parameters(), lr=1e-3)
+    x, y = torch.randn(64, 16), torch.randn(64, 1)
+    bad = x.clone(); bad[3, 7] = float('nan')
+    def step(m, s):
+        xin = bad if s >= 20 else x
+        return F.mse_loss(m(xin), y)
+    return m, opt, step
 
 
-# =============================================================================
-# Organic Failure Scenarios
-# =============================================================================
-
-def scenario_high_lr(model_class):
-    """High learning rate without any stabilization."""
-    model = model_class()
-    optimizer = optim.SGD(model.parameters(), lr=1.0)  # Extremely high LR
-    return model, optimizer, "High LR (1.0)"
-
-
-def scenario_high_lr_no_decay(model_class):
-    """High LR + no weight decay."""
-    model = model_class()
-    optimizer = optim.Adam(model.parameters(), lr=0.1, weight_decay=0)
-    return model, optimizer, "High LR + No Decay"
+def sc_log_zero():
+    """Custom loss takes log of a probability that underflows to exactly 0."""
+    m = mlp(d_out=4)
+    opt = torch.optim.SGD(m.parameters(), lr=0.5)
+    x = torch.randn(64, 16); y = torch.randint(0, 4, (64,))
+    def step(m, s):
+        logits = m(x)
+        if s >= 20:
+            logits = logits * 200.0          # saturates softmax to exact 0/1
+        p = torch.softmax(logits, dim=-1)
+        return F.nll_loss(torch.log(p), y)   # log(0) -> -inf, no eps guard
+    return m, opt, step
 
 
-def scenario_bad_init(model_class):
-    """Bad weight initialization."""
-    model = model_class()
-    for p in model.parameters():
-        if p.dim() >= 2:
-            nn.init.uniform_(p, -10, 10)  # Extreme initialization
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
-    return model, optimizer, "Bad Initialization"
+def sc_fp16_overflow():
+    """Half precision without a grad scaler: activations overflow to inf."""
+    m = mlp(h=256).half()
+    opt = torch.optim.SGD(m.parameters(), lr=0.1)
+    x = (torch.randn(64, 16) * 30).half(); y = torch.randn(64, 1).half()
+    def step(m, s):
+        xin = x * (60.0 if s >= 20 else 1.0)
+        return F.mse_loss(m(xin), y).float()
+    return m, opt, step
 
 
-def scenario_pathological_data(model_class):
-    """Training with pathological data (extreme outliers)."""
-    model = model_class()
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
-    return model, optimizer, "Pathological Data"
+def sc_dead_relu():
+    """Silent failure: large negative bias kills every ReLU. Gradients vanish,
+    loss flatlines at a finite value. Nothing is nan."""
+    m = mlp(depth=4)
+    opt = torch.optim.SGD(m.parameters(), lr=0.05)
+    x, y = torch.randn(64, 16), torch.randn(64, 1)
+    def step(m, s):
+        if s == 20:
+            with torch.no_grad():
+                for mod in m:
+                    if isinstance(mod, nn.Linear):
+                        mod.bias.fill_(-50.0)   # a bad init/LR would do this too
+        return F.mse_loss(m(x), y)
+    return m, opt, step
 
 
-SCENARIOS = [
-    scenario_high_lr,
-    scenario_high_lr_no_decay,
-    scenario_bad_init,
-    scenario_pathological_data,
-]
+def sc_rnn_gradient_explosion():
+    """Long unrolled RNN, spectral radius > 1, no clipping."""
+    class R(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.cell = nn.RNNCell(8, 32)
+            self.out = nn.Linear(32, 1)
+            with torch.no_grad():
+                self.cell.weight_hh.mul_(3.0)
+        def forward(self, x):
+            h = torch.zeros(x.size(0), 32)
+            for t in range(x.size(1)):
+                h = self.cell(x[:, t], h)
+            return self.out(h)
+    m = R()
+    opt = torch.optim.SGD(m.parameters(), lr=0.1)
+    x, y = torch.randn(32, 60, 8), torch.randn(32, 1)
+    return m, opt, lambda m, s: F.mse_loss(m(x), y)
 
 
-# =============================================================================
-# Test Runner
-# =============================================================================
-
-def create_data(model, pathological=False):
-    """Create appropriate data for model."""
-    if isinstance(model, DeepVanillaRNN) or isinstance(model, UnstableTransformer):
-        X = torch.randn(200, 20, 50)  # (batch, seq, features)
-    else:
-        X = torch.randn(200, 100)
-    
-    y = torch.randint(0, 10, (200,))
-    
-    if pathological:
-        # Add extreme outliers
-        X[:10] = X[:10] * 1000  # 10 extreme samples
-        X[10:20] = X[10:20] * 0.0001  # 10 tiny samples
-    
-    return X, y
+def sc_zero_variance_batch():
+    """Degenerate batch: every row identical, so a std-normalization divides
+    by zero. Happens for real with a bad sampler or a sorted dataset."""
+    m = mlp()
+    opt = torch.optim.Adam(m.parameters(), lr=1e-3)
+    x, y = torch.randn(64, 16), torch.randn(64, 1)
+    dup = x[0:1].repeat(64, 1)
+    def step(m, s):
+        xin = dup if s >= 20 else x
+        xin = (xin - xin.mean(0)) / xin.std(0)   # std == 0 -> nan
+        return F.mse_loss(m(xin), y)
+    return m, opt, step
 
 
-def run_organic_test(model_class, scenario_fn, use_arc=True, n_epochs=10, seed=42):
-    """Run organic failure test."""
-    
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    
-    model, optimizer, scenario_name = scenario_fn(model_class)
-    
-    # Pathological data for that specific scenario
-    pathological = (scenario_fn == scenario_pathological_data)
-    X, y = create_data(model, pathological=pathological)
-    dataloader = DataLoader(TensorDataset(X, y), batch_size=16, shuffle=True)
-    
-    # ARC setup
-    shard = None
+def sc_loss_scale_spike():
+    """A single pathological sample with a huge target dominates the batch."""
+    m = mlp()
+    opt = torch.optim.SGD(m.parameters(), lr=0.01)
+    x, y = torch.randn(64, 16), torch.randn(64, 1)
+    ybad = y.clone(); ybad[0] = 1e12
+    def step(m, s):
+        return F.mse_loss(m(x), ybad if s >= 20 else y)
+    return m, opt, step
+
+
+SCENARIOS = {
+    'lr_too_high': sc_lr_too_high,
+    'nan_in_data': sc_nan_in_data,
+    'log_zero': sc_log_zero,
+    'fp16_overflow': sc_fp16_overflow,
+    'dead_relu_silent': sc_dead_relu,
+    'rnn_grad_explosion': sc_rnn_gradient_explosion,
+    'zero_variance_batch': sc_zero_variance_batch,
+    'loss_spike_outlier': sc_loss_scale_spike,
+}
+
+
+def params_finite(m):
+    return all(torch.isfinite(p).all().item() for p in m.parameters())
+
+
+def run(name, use_arc):
+    torch.manual_seed(0)
+    m, opt, stepfn = SCENARIOS[name]()
+    ctrl = None
     if use_arc:
-        config = SelfHealingConfig(
-            checkpoint_frequency=5,
-            loss_explosion_threshold=50.0,
-            gradient_explosion_threshold=1e4,
-            lr_reduction_factor=0.1,
-            verbose=False,
-        )
-        shard = SelfHealingArc(model, optimizer, config)
-    
-    result = {
-        'model': model_class.__name__,
-        'scenario': scenario_name,
-        'use_arc': use_arc,
-        'epochs_completed': 0,
-        'diverged': False,
-        'crashed': False,
-        'rollbacks': 0,
-        'lr_reductions': 0,
-        'losses': [],
-    }
-    
-    try:
-        for epoch in range(n_epochs):
-            epoch_losses = []
-            
-            for batch_idx, (x, labels) in enumerate(dataloader):
-                optimizer.zero_grad()
-                
-                out = model(x)
-                loss = F.cross_entropy(out, labels)
-                
-                # Check for natural divergence
-                if torch.isnan(loss) or torch.isinf(loss):
-                    if not use_arc:
-                        result['diverged'] = True
-                        break
-                
-                if loss.item() > 1e6:  # Natural explosion
-                    if not use_arc:
-                        result['diverged'] = True
-                        break
-                
-                # ARC protection
-                if shard:
-                    action = shard.step(loss)
-                    if action.should_skip:
-                        if action.rolled_back:
-                            result['rollbacks'] += 1
-                        if action.lr_reduced:
-                            result['lr_reductions'] += 1
-                        continue
-                
-                loss.backward()
-                
-                # Check gradient explosion
-                grad_norm = 0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        grad_norm += p.grad.norm().item() ** 2
-                grad_norm = grad_norm ** 0.5
-                
-                if grad_norm > 1e6 and not use_arc:
-                    result['diverged'] = True
-                    break
-                
-                if shard:
-                    shard.post_backward()
-                
-                optimizer.step()
-                epoch_losses.append(loss.item())
-            
-            if result['diverged']:
-                break
-            
-            if epoch_losses:
-                result['losses'].append(np.mean(epoch_losses))
-            result['epochs_completed'] = epoch + 1
-    
-    except Exception as e:
-        result['crashed'] = True
-        result['error'] = str(e)[:100]
-    
-    if shard:
-        stats = shard.get_stats()
-        result['rollbacks'] = stats['total_rollbacks']
-        result['lr_reductions'] = stats['lr_reductions']
-    
-    return result
+        cfg = ControllerConfig(checkpoint_frequency=5, verbose=False,
+                               auto_calibrate=True, calibration_steps=10)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ctrl = Controller(m, opt, config=cfg)
+    detected = recovered = False
+    losses = []
+    for s in range(STEPS):
+        opt.zero_grad()
+        try:
+            loss = stepfn(m, s)
+        except Exception as e:
+            return dict(name=name, arc=use_arc, outcome=f'raised {type(e).__name__}',
+                        detected=detected, finite=params_finite(m), losses=losses)
+        lv = float(loss.detach())
+        losses.append(lv)
+        if ctrl is not None:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                a = ctrl.step(loss)
+            if a.failure_type:
+                detected = True
+            if a.rolled_back or a.lr_reduced or a.gradients_clipped:
+                recovered = True
+            if a.should_skip or a.rolled_back:
+                continue
+        if torch.isfinite(loss):
+            loss.backward()
+            opt.step()
+    finite = params_finite(m)
+    tail = [l for l in losses[-10:] if math.isfinite(l)]
+    healthy_end = finite and len(tail) >= 5
+    return dict(name=name, arc=use_arc,
+                outcome='healthy' if healthy_end else 'broken',
+                detected=detected, recovered=recovered, finite=finite,
+                losses=losses)
 
 
-def run_organic_failure_suite():
-    """Run full organic failure test suite."""
-    
-    print("="*70)
-    print("🌿 ORGANIC FAILURE TEST SUITE")
-    print("   Testing REAL failure scenarios (not synthetic injections)")
-    print("="*70)
-    
-    model_classes = [VeryDeepMLP, DeepVanillaRNN, UnstableTransformer]
-    
-    all_results = []
-    
-    for model_class in model_classes:
-        print(f"\n{'='*70}")
-        print(f"MODEL: {model_class.__name__}")
-        print("="*70)
-        
-        for scenario_fn in SCENARIOS:
-            # Get scenario name
-            _, _, scenario_name = scenario_fn(model_class)
-            print(f"\n  Scenario: {scenario_name}")
-            
-            # Baseline
-            baseline = run_organic_test(model_class, scenario_fn, use_arc=False)
-            b_status = "DIVERGED" if baseline['diverged'] else ("CRASH" if baseline['crashed'] else "OK")
-            print(f"    Baseline: {b_status} (epochs: {baseline['epochs_completed']})")
-            
-            # With ARC
-            arc_result = run_organic_test(model_class, scenario_fn, use_arc=True)
-            a_status = "DIVERGED" if arc_result['diverged'] else ("CRASH" if arc_result['crashed'] else "OK")
-            print(f"    ARC:      {a_status} (epochs: {arc_result['epochs_completed']}, rollbacks: {arc_result['rollbacks']})")
-            
-            # Did ARC save this?
-            baseline_failed = baseline['diverged'] or baseline['crashed']
-            arc_ok = not arc_result['diverged'] and not arc_result['crashed']
-            saved = baseline_failed and arc_ok
-            
-            all_results.append({
-                'model': model_class.__name__,
-                'scenario': scenario_name,
-                'baseline': baseline,
-                'arc': arc_result,
-                'saved': saved,
-            })
-    
-    # Summary
-    print("\n" + "="*70)
-    print("🌿 ORGANIC FAILURE SUMMARY")
-    print("="*70)
-    
-    print("\n| Model | Scenario | Baseline | ARC | Rollbacks | Saved? |")
-    print("|-------|----------|----------|-----|-----------|--------|")
-    
-    total_baseline_fails = 0
-    total_arc_saves = 0
-    
-    for r in all_results:
-        b_status = "FAIL" if (r['baseline']['diverged'] or r['baseline']['crashed']) else "OK"
-        a_status = "FAIL" if (r['arc']['diverged'] or r['arc']['crashed']) else "OK"
-        saved = "YES" if r['saved'] else "No"
-        
-        if b_status == "FAIL":
-            total_baseline_fails += 1
-        if r['saved']:
-            total_arc_saves += 1
-        
-        print(f"| {r['model']:20} | {r['scenario']:20} | {b_status:8} | {a_status:3} | {r['arc']['rollbacks']:9} | {saved:6} |")
-    
-    print(f"\nARC saved {total_arc_saves}/{total_baseline_fails} organically failing runs")
-    
-    # Save
-    with open("organic_failure_results.json", "w") as f:
-        json.dump(all_results, f, indent=2, default=str)
-    
-    print("\nResults saved to: organic_failure_results.json")
-    
-    return all_results
-
-
-if __name__ == "__main__":
-    run_organic_failure_suite()
+if __name__ == '__main__':
+    only = sys.argv[1] if len(sys.argv) > 1 else None
+    rows = []
+    for n in SCENARIOS:
+        if only and only != n:
+            continue
+        base = run(n, False)
+        arc = run(n, True)
+        rows.append((n, base, arc))
+    print(f"{'scenario':<22} {'no-arc':<22} {'arc':<12} {'detected':<9} {'recovered'}")
+    print('-' * 80)
+    for n, b, a in rows:
+        print(f"{n:<22} {b['outcome']:<22} {a['outcome']:<12} "
+              f"{str(a.get('detected')):<9} {a.get('recovered')}")

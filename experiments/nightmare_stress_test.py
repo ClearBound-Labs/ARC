@@ -19,6 +19,10 @@
 """
 ARC NIGHTMARE STRESS TEST - Extreme Failure Scenarios
 
+SUPERSEDED by experiments/recovery_benchmark.py. This script never applies its
+crash checks to the ARC-protected run, so its "recovered" count means "didn't
+raise an exception". Don't quote its numbers.
+
 Testing ARC against the WORST POSSIBLE failure conditions:
 
 ============================================================
@@ -89,6 +93,8 @@ from arc.core.self_healing import SelfHealingArc, SelfHealingConfig
 
 @dataclass
 class TestResult:
+    __test__ = False  # not a pytest test class, just named "Test*"
+
     scenario_name: str
     tier: str
     baseline_crashed: bool

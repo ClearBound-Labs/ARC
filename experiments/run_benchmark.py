@@ -54,7 +54,7 @@ from arc.experiments import (
     FailureType,
     get_all_baselines,
 )
-from arc.introspection import Arc
+from arc.introspection import IntrospectiveArc as Arc
 
 
 def create_results_dir() -> Path:

@@ -17,6 +17,7 @@
 # along with ARC. If not, see <https://www.gnu.org/licenses/>.
 
 from typing import Dict, Any, Optional, List
+import warnings
 import torch
 import torch.nn as nn
 import numpy as np
@@ -75,7 +76,11 @@ class WeightCollector(SignalCollector):
             if name in self._prev_weights:
                 prev = self._prev_weights[name]
                 if prev.shape == weight.shape:
-                    update = weight - prev
+                    # prev is cached on the host to keep checkpoints off the GPU,
+                    # so it has to come back to the weight's device before the
+                    # subtraction. Without this, every update-ratio computation
+                    # raises on any CUDA model and the signal silently vanishes.
+                    update = weight - prev.to(weight.device, non_blocking=True)
                     update_norm = torch.norm(update, p=2).item()
                     stats["weight_update_norm"] = update_norm
                     all_update_norms.append(update_norm)
@@ -100,7 +105,12 @@ class WeightCollector(SignalCollector):
 
             signals["layer_stats"][name] = stats
 
-            self._prev_weights[name] = weight.clone().cpu()
+            # Kept on the weight's own device. Round-tripping the whole model to
+            # host memory once per collection cost more than the signal it feeds
+            # (a single update-ratio scalar) and forced a sync every layer. The
+            # price is one model-sized copy resident on the device, which is the
+            # same order as a single checkpoint.
+            self._prev_weights[name] = weight.clone()
             self._prev_norms[name] = weight_norm
 
         if all_norms:
@@ -129,7 +139,12 @@ class WeightCollector(SignalCollector):
             elif weight.dim() == 1:
                 return None
 
-            weight_cpu = weight.float().cpu()
+            # Compute on whatever device the weight already lives on. Copying
+            # every layer to the host and running the SVD on CPU made this the
+            # single most expensive thing the collector did — it dominated total
+            # instrumentation cost on a mid-size CNN, on top of forcing a device
+            # sync per layer. cuSOLVER handles both paths below natively.
+            weight_cpu = weight.float()
 
             m, n = weight_cpu.shape
             if m * n > 10000:
@@ -139,14 +154,16 @@ class WeightCollector(SignalCollector):
 
                     U, S, Vh = torch.svd_lowrank(weight_cpu, q=k)
                     singular_values = S
-                except:
+                except Exception as e:
+                    warnings.warn(f"svd_lowrank failed computing effective rank: {e}")
                     return None
             else:
 
                 try:
                     U, S, Vh = torch.linalg.svd(weight_cpu, full_matrices=False)
                     singular_values = S
-                except:
+                except Exception as e:
+                    warnings.warn(f"SVD failed computing effective rank: {e}")
                     return None
 
             singular_values = singular_values[singular_values > 1e-10]

@@ -24,6 +24,7 @@ from enum import Enum, auto
 import gc
 import warnings
 import functools
+from arc._logging import log as _log
 
 class OOMStrategy(Enum):
     CLEAR_CACHE = auto()
@@ -77,7 +78,6 @@ class OOMRecoveryHandler:
         self.config = config or OOMConfig()
         self.state = OOMRecoveryState()
 
-        self._original_optimizer_state = None
         self._checkpointable_modules: List[nn.Module] = []
 
         self.device = next(model.parameters()).device
@@ -86,9 +86,9 @@ class OOMRecoveryHandler:
         self._find_checkpointable_modules()
 
         if self.config.verbose:
-            print(f"OOMRecoveryHandler initialized")
-            print(f"   Device: {self.device}")
-            print(f"   Checkpointable modules: {len(self._checkpointable_modules)}")
+            _log(f"OOMRecoveryHandler initialized")
+            _log(f"   Device: {self.device}")
+            _log(f"   Checkpointable modules: {len(self._checkpointable_modules)}")
 
     def _find_checkpointable_modules(self):
         from torch.utils.checkpoint import checkpoint
@@ -111,7 +111,7 @@ class OOMRecoveryHandler:
         if self.config.verbose:
             allocated = torch.cuda.memory_allocated() / 1e9
             reserved = torch.cuda.memory_reserved() / 1e9
-            print(f"   🧹 Cleared CUDA cache. Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+            _log(f"   🧹 Cleared CUDA cache. Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
 
         return True
 
@@ -150,7 +150,7 @@ class OOMRecoveryHandler:
         reduced_batch = self._slice_batch(current_batch, new_batch_size)
 
         if self.config.verbose:
-            print(f"   Reduced batch size: {batch_size} → {new_batch_size}")
+            _log(f"   Reduced batch size: {batch_size} → {new_batch_size}")
 
         return True, reduced_batch
 
@@ -184,7 +184,7 @@ class OOMRecoveryHandler:
         if enabled_count > 0:
             self.state.gradient_checkpointing_enabled = True
             if self.config.verbose:
-                print(f"   Enabled gradient checkpointing on {enabled_count} modules")
+                _log(f"   Enabled gradient checkpointing on {enabled_count} modules")
             return True
 
         return False
@@ -195,13 +195,6 @@ class OOMRecoveryHandler:
 
         if not self.is_cuda:
             return False
-
-        if self._original_optimizer_state is None:
-            self._original_optimizer_state = {
-                k: {k2: v2.clone() if isinstance(v2, torch.Tensor) else v2
-                    for k2, v2 in v.items()}
-                for k, v in self.optimizer.state.items()
-            }
 
         moved_count = 0
         for param_state in self.optimizer.state.values():
@@ -216,7 +209,7 @@ class OOMRecoveryHandler:
             torch.cuda.empty_cache()
 
             if self.config.verbose:
-                print(f"   Offloaded {moved_count} optimizer tensors to CPU")
+                _log(f"   Offloaded {moved_count} optimizer tensors to CPU")
             return True
 
         return False
@@ -232,7 +225,7 @@ class OOMRecoveryHandler:
         self.device = torch.device("cpu")
 
         if self.config.verbose:
-            print(f"   Moved model to CPU (last resort)")
+            _log(f"   Moved model to CPU (last resort)")
 
         return True
 
@@ -277,9 +270,15 @@ class OOMRecoveryHandler:
             try:
                 return forward_fn(current_batch)
             except RuntimeError as e:
-                if "out of memory" in str(e).lower() or "CUDA" in str(e):
+                # Narrow match only ("out of memory"), not "CUDA" generically --
+                # a broad "CUDA" substring match would funnel unrelated CUDA
+                # errors (illegal memory access, device-side assert, cuDNN
+                # errors) into OOM recovery instead of surfacing the real bug.
+                # Matches the narrower check already used by safe_backward/
+                # safe_step below and by hardware_handler.py.
+                if "out of memory" in str(e).lower():
                     if self.config.verbose:
-                        print(f"OOM detected (attempt {retries + 1}/{self.config.max_retries})")
+                        _log(f"OOM detected (attempt {retries + 1}/{self.config.max_retries})")
 
                     success, current_batch = self.try_recover(current_batch)
 
@@ -304,7 +303,7 @@ class OOMRecoveryHandler:
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     if self.config.verbose:
-                        print(f"OOM during backward (attempt {retries + 1})")
+                        _log(f"OOM during backward (attempt {retries + 1})")
 
                     success, _ = self.try_recover()
                     if not success:
@@ -329,7 +328,7 @@ class OOMRecoveryHandler:
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     if self.config.verbose:
-                        print(f"OOM during optimizer step (attempt {retries + 1})")
+                        _log(f"OOM during optimizer step (attempt {retries + 1})")
 
                     success, _ = self.try_recover()
                     if not success:
@@ -383,7 +382,7 @@ def oom_protected(func: Callable) -> Callable:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     retries += 1
-                    print(f"OOM in {func.__name__}, retry {retries}/{max_retries}")
+                    _log(f"OOM in {func.__name__}, retry {retries}/{max_retries}")
                 else:
                     raise
 

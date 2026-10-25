@@ -19,10 +19,12 @@
 import torch
 import torch.nn as nn
 from typing import Optional, Dict, Any, Callable
+import math
 from dataclasses import dataclass, field
 from collections import deque
 import copy
 import warnings
+from arc._logging import log as _log
 
 @dataclass
 class RollbackConfig:
@@ -52,6 +54,9 @@ class RollbackConfig:
     skip_stable_layers: bool = True
     layer_sample_ratio: float = 0.3
 
+    weight_norm_monitoring: bool = True
+    weight_norm_explosion_factor: float = 10.0
+
 @dataclass
 class RollbackState:
     step_count: int = 0
@@ -64,6 +69,7 @@ class RollbackState:
     stable_step_count: int = 0
     current_check_frequency: int = 50
     stable_layers: set = field(default_factory=set)
+    prev_weight_norms: Dict = field(default_factory=dict)
 
 class WeightRollback:
     def __init__(
@@ -79,8 +85,15 @@ class WeightRollback:
         self.verbose = verbose
 
         self.state = RollbackState()
+        # Apply configured max_checkpoints to the deque (the dataclass default
+        # hardcodes maxlen=3; this ensures the user-provided value is honoured).
+        self.state.checkpoints = deque(maxlen=self.config.max_checkpoints)
         self._update_current_lr()
         self.state.initial_lr = self.state.current_lr
+        # Cumulative product of every LR reduction. Restoring a checkpoint also
+        # restores the optimizer's param_groups (lr included), which would undo
+        # the reduction, so it is re-applied after each restore.
+        self._lr_penalty: float = 1.0
 
         self._param_names = [name for name, _ in model.named_parameters()]
         self._n_params = len(self._param_names)
@@ -108,12 +121,13 @@ class WeightRollback:
             'model_state': copy.deepcopy(self.model.state_dict()),
             'optimizer_state': copy.deepcopy(self.optimizer.state_dict()),
             'lr': self.state.current_lr,
+            'lr_penalty': self._lr_penalty,
             'rng_state': rng_state,
         }
         self.state.checkpoints.append(checkpoint)
 
         if self.verbose and len(self.state.checkpoints) == 1:
-            print(f"   WeightRollback: Initial checkpoint saved (with RNG state)")
+            _log(f"   WeightRollback: Initial checkpoint saved (with RNG state)")
 
     def _restore_checkpoint(self, checkpoint_idx: int = -1) -> int:
         if not self.state.checkpoints:
@@ -123,7 +137,17 @@ class WeightRollback:
         checkpoint = self.state.checkpoints[checkpoint_idx]
 
         self.model.load_state_dict(checkpoint['model_state'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+        # Copy: Optimizer.load_state_dict keeps same-device tensors as-is, so
+        # training would otherwise mutate the stored checkpoint in place.
+        self.optimizer.load_state_dict(copy.deepcopy(checkpoint['optimizer_state']))
+
+        # load_state_dict brings back the LR in force when the checkpoint was
+        # taken; re-apply only the reductions made since then.
+        ratio = self._lr_penalty / checkpoint.get('lr_penalty', 1.0)
+        if ratio != 1.0:
+            for pg in self.optimizer.param_groups:
+                pg['lr'] *= ratio
+        self._update_current_lr()
 
         rng_state = checkpoint.get('rng_state', {})
         if rng_state.get('torch') is not None:
@@ -140,7 +164,7 @@ class WeightRollback:
         steps_back = self.state.step_count - checkpoint['step']
 
         if self.verbose:
-            print(f"  Rolled back {steps_back} steps to step {checkpoint['step']} (RNG restored)")
+            _log(f"  Rolled back {steps_back} steps to step {checkpoint['step']} (RNG restored)")
 
         # Reset detection state so stale pre-rollback losses don't immediately re-trigger
         self.state.loss_history.clear()
@@ -153,9 +177,21 @@ class WeightRollback:
         for pg in self.optimizer.param_groups:
             pg['lr'] *= self.config.lr_reduction_factor
             self.state.current_lr = pg['lr']
+        self._lr_penalty *= self.config.lr_reduction_factor
 
         if self.verbose:
-            print(f"  Reduced LR to {self.state.current_lr:.2e}")
+            _log(f"  Reduced LR to {self.state.current_lr:.2e}")
+
+    def restore_checkpoint(self, checkpoint_idx: int = -1) -> int:
+        """Public entry point for callers outside this class that need to
+        force a rollback (e.g. in response to a signal WeightRollback itself
+        didn't detect, like a silent-failure detector)."""
+        return self._restore_checkpoint(checkpoint_idx)
+
+    def reduce_learning_rate(self):
+        """Public entry point for callers outside this class that need to
+        force an LR reduction (see `restore_checkpoint`)."""
+        self._reduce_learning_rate()
 
     def _detect_failure(self, loss: torch.Tensor) -> Dict[str, Any]:
         failure = {
@@ -240,7 +276,36 @@ class WeightRollback:
                 failure['detected'] = True
                 failure['type'] = 'nan_weights'
                 failure['details']['layer'] = name
+                # A layer that just failed is not "known stable" -- make sure
+                # it stays in the actively-checked rotation.
+                self.state.stable_layers.discard(name)
                 return failure
+
+        # Weight norm deviation detection: catch subtle weight corruption
+        if self.config.weight_norm_monitoring and self.state.step_count > 1:
+            for name, p in params_to_check:
+                current_norm = torch.linalg.vector_norm(p.data, ord=2).item()
+                if name in self.state.prev_weight_norms:
+                    prev_norm = self.state.prev_weight_norms[name]
+                    if prev_norm > 0 and not math.isnan(current_norm):
+                        ratio = current_norm / prev_norm
+                        if ratio > self.config.weight_norm_explosion_factor:
+                            failure['detected'] = True
+                            failure['type'] = 'weight_norm_explosion'
+                            failure['details']['layer'] = name
+                            failure['details']['prev_norm'] = prev_norm
+                            failure['details']['current_norm'] = current_norm
+                            failure['details']['ratio'] = ratio
+                            self.state.stable_layers.discard(name)
+                            return failure
+                self.state.prev_weight_norms[name] = current_norm
+                # Passed both the NaN and weight-norm checks this round --
+                # this is what "stable" means for _get_params_to_check's
+                # sampling, which previously never had anything to read here
+                # (stable_layers was never populated, so every step sampled
+                # uniformly at random from ALL params instead of prioritizing
+                # layers that haven't been vetted recently).
+                self.state.stable_layers.add(name)
 
         return failure
 
@@ -278,11 +343,15 @@ class WeightRollback:
 
         failure = self._detect_failure(loss)
 
+        # Any detected failure skips the optimizer step, even when a rollback
+        # isn't allowed (cooldown, per-epoch budget): stepping on NaN/exploded
+        # gradients would poison the weights.
         action = RollbackAction(
             step=self.state.step_count,
             rolled_back=False,
             failure_detected=failure['detected'],
             failure_type=failure.get('type'),
+            should_skip=failure['detected'],
         )
 
         if failure['detected'] and not in_cooldown:
@@ -298,10 +367,10 @@ class WeightRollback:
                 action.new_lr = self.state.current_lr
 
                 if self.verbose:
-                    print(f"  Rollback #{self.state.rollback_count}: {failure['type']}")
+                    _log(f"  Rollback #{self.state.rollback_count}: {failure['type']}")
             else:
                 if self.verbose:
-                    print(f"  Max rollbacks reached, not rolling back")
+                    _log(f"  Max rollbacks reached, not rolling back")
 
         if self.state.step_count % self.config.checkpoint_frequency == 0:
             if not failure['detected']:
@@ -330,6 +399,7 @@ class RollbackAction:
     failure_type: Optional[str] = None
     steps_back: int = 0
     new_lr: float = 0.0
+    should_skip: bool = False
 
 def create_self_healing_arc(model, optimizer, safety_level="standard"):
     from arc import ArcV2

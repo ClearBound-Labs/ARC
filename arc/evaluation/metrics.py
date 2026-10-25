@@ -257,9 +257,18 @@ class MetricsCalculator:
             if not pred:
                 continue
 
+            # ECE measures calibration between confidence and correctness;
+            # without a ground-truth label there is no correctness signal
+            # to compare against, so these samples are excluded rather than
+            # substituted with an unrelated confidence-threshold proxy
+            # (which measured something else entirely and silently mixed
+            # two different notions of "correct" into the same bins).
+            if gt is None:
+                continue
+
             max_mode = max(pred, key=pred.get)
             max_prob = pred[max_mode]
-            is_correct = (gt == max_mode) if gt else (max_prob < self.threshold)
+            is_correct = gt == max_mode
 
             confidences.append(max_prob)
             accuracies.append(1 if is_correct else 0)

@@ -19,6 +19,7 @@
 from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from dataclasses import dataclass
 
@@ -242,5 +243,3 @@ class SpectralAnalyzer:
         weights = np.clip(weights, 1.0, boost_factor)
 
         return weights
-
-import torch.nn.functional as F

@@ -17,6 +17,7 @@
 # along with ARC. If not, see <https://www.gnu.org/licenses/>.
 
 from typing import Dict, List, Optional, Tuple, Callable
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -119,13 +120,19 @@ class AdversarialDetector:
                 all_activations[name].append(flat.cpu())
 
             entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
-            all_entropies.extend(entropy.cpu().numpy().tolist())
+            all_entropies.extend(entropy.detach().cpu().numpy().tolist())
 
             loss = F.cross_entropy(logits, y)
+            # Only x.grad is needed here, but backward() also accumulates into
+            # every model parameter with requires_grad=True. Without zeroing,
+            # this silently pollutes the caller's optimizer state if they
+            # later call optimizer.step() without an explicit zero_grad first.
+            self.model.zero_grad(set_to_none=True)
             loss.backward()
 
             grad_mag = x.grad.view(x.size(0), -1).norm(dim=-1)
             all_grad_mags.extend(grad_mag.cpu().numpy().tolist())
+            self.model.zero_grad(set_to_none=True)
 
             sample_count += x.size(0)
 
@@ -187,12 +194,18 @@ class AdversarialDetector:
 
         if "gradient" in self.methods:
             loss = logits.max(dim=-1).values.sum()
+            # Same rationale as fit(): backward() accumulates into model
+            # parameter .grad as a side effect of computing x.grad; zero it
+            # before and after so detect() (routinely called on production
+            # inputs) doesn't silently corrupt the caller's optimizer state.
+            self.model.zero_grad(set_to_none=True)
             loss.backward()
 
             grad_mag = x.grad.view(x.size(0), -1).norm(dim=-1).mean().item()
             grad_z = (grad_mag - self._grad_mean) / self._grad_std
 
             scores["gradient"] = min(max(grad_z, 0) / 3.0, 1.0)
+            self.model.zero_grad(set_to_none=True)
 
         self._remove_hooks()
         self.model.train()
@@ -237,7 +250,8 @@ class AdversarialDetector:
                 centered = flat - mean
                 maha = torch.sqrt(torch.sum(centered @ cov_inv * centered, dim=-1))
                 distances.append(maha.mean().item())
-            except:
+            except Exception as e:
+                warnings.warn(f"Mahalanobis distance computation failed for layer '{name}': {e}")
                 continue
 
         if distances:

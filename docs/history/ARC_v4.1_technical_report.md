@@ -1,12 +1,14 @@
 <div align="center">
 
-# ARC v4.1 — Technical Report
+# ARC v4.1 Technical Report
 
 ### Efficiency, Recovery Performance, and Scalability Analysis
 
-_Updated March 2026 · All numbers backed by reproducible experiment scripts_
+_March 2026_
 
 </div>
+
+> **Historical document.** This report describes ARC v4.1. Its numbers predate the October 2026 audit, which found that several stress scripts didn't apply their crash checks to the protected run. For current, symmetric results, see the [README benchmarks](../../README.md#benchmarks).
 
 ---
 
@@ -141,8 +143,8 @@ Overhead decreases with model size because forward/backward cost grows superline
 
 | Claim                | Status                                                                                     |
 | :------------------- | :----------------------------------------------------------------------------------------- |
-| GPU overhead         | Untested — all measurements on CPU                                                         |
-| Scale >117M          | Untested — behaviour at 1B+ unknown                                                        |
-| Organic failures     | Untested — all failures injected programmatically                                          |
-| Distributed training | Untested — single-process only                                                             |
-| Non-CIFAR datasets   | Limited — stress tests use domain-appropriate data but prediction experiments use CIFAR-10 |
+| GPU overhead         | Untested: all measurements on CPU |
+| Scale >117M          | Untested: behaviour at 1B+ unknown |
+| Organic failures     | Untested: all failures injected programmatically |
+| Distributed training | Untested: single-process only |
+| Non-CIFAR datasets   | Limited: stress tests use domain-appropriate data, prediction experiments use CIFAR-10 |

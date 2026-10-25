@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 
 from arc.introspection import (
-    Arc,
+    IntrospectiveArc as Arc,
     FisherRaoGeometry,
     LyapunovEstimator,
 )

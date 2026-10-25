@@ -17,7 +17,7 @@ We aim to acknowledge reports within seven days.
 
 ARC's checkpoint loading uses `torch.load()`, which deserializes data with
 Python's `pickle` protocol. Pickle executes arbitrary code during
-deserialization through the `__reduce__` mechanism — a checkpoint file
+deserialization through the `__reduce__` mechanism, so a checkpoint file
 is effectively executable Python.
 
 **Treat any checkpoint file you did not produce yourself as untrusted
@@ -31,27 +31,29 @@ code.** This includes, at minimum:
 
 ### What ARC does
 
-As of this release, ARC loads checkpoints with `weights_only=True` first.
-This restricts unpickling to a safe subset of types and rejects payloads
-that try to execute arbitrary callables via `__reduce__`. If that load
-fails — typically because the checkpoint contains optimizer state,
-schedulers, or other non-tensor Python objects — ARC falls back to
-`weights_only=False` after emitting a `UserWarning` of the form:
+Since 5.2.0 every ARC loader (`arc._serialization.safe_torch_load`) uses
+`weights_only=True`, which restricts unpickling to tensors and plain Python
+values and rejects payloads that try to call arbitrary code via
+`__reduce__`. A file that needs more than that fails to load with
+`pickle.UnpicklingError`. **There is no automatic fallback.**
 
-``` Loading <path> with weights_only=False. Only do this for checkpoints
-you produced yourself. See SECURITY.md for the checkpoint trust boundary.```
+Unsafe loading exists only as an explicit opt-in, for files you produced
+yourself: `allow_unsafe=True` on `MetaModelTrainer.load_checkpoint` and
+`ArcV2.load`, `AdaptiveCheckpointConfig(allow_unsafe_load=True)`. It warns
+every time it is used.
 
-The fallback is provided for backward compatibility with existing
-checkpoints. **It reintroduces the pickle code-execution risk for the
-duration of that specific load.** If you see this warning for a
-checkpoint you did not produce, treat it as a refusal-to-load signal,
-not a routine notice.
+Checkpoints ARC writes itself (`Controller.save_checkpoint`, the adaptive
+checkpointer's disk tier) contain only tensors and plain values, so they
+always load safely.
 
-### What ARC does NOT do
+### Integrity checks
 
-ARC does not verify the integrity of checkpoint files. There is no
-signature or hash check. If you transfer checkpoints between machines or
-download them, verify integrity through your own out-of-band channel.
+`AdaptiveCheckpointConfig(sign_checkpoints=True, signing_key=...)` stores a
+SHA-256 content hash and an HMAC signature with each checkpoint and verifies
+both on restore. The Controller's recovery ledger can be HMAC-keyed with
+`ControllerConfig(ledger_key=...)` or the `ARC_LEDGER_KEY` environment
+variable; without a key, its hash chain only reveals accidental edits.
+Neither replaces verifying checkpoints you download from elsewhere.
 
 ## Hardening Recommendations
 
@@ -67,10 +69,10 @@ download them, verify integrity through your own out-of-band channel.
    producer and transport before loading. A signed hash from a trusted
    channel is the simplest verification.
 
-3. **Pay attention to fallback warnings.** A `weights_only=False`
-   warning means the file contains pickle-deserializable objects
-   beyond pure tensors. For checkpoints from untrusted sources,
-   refuse to load.
+3. **Never opt in to unsafe loading for files you didn't write.** If an
+   ARC load fails with `UnpicklingError`, the file contains objects
+   beyond tensors and plain values; for anything from an untrusted
+   source, that is the refusal working as intended.
 
 4. **Run on a separate user account for untrusted training data.** If
    you must work with checkpoints from outside your team, sandbox the

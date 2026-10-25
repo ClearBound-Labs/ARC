@@ -21,6 +21,7 @@ import torch.nn as nn
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass, field
 from collections import deque
+import warnings
 import numpy as np
 
 @dataclass
@@ -114,7 +115,8 @@ class GradientForecaster:
             slope = np.polyfit(x, log_norms, 1)[0]
 
             growth_rate = np.exp(slope)
-        except:
+        except Exception as e:
+            warnings.warn(f"Gradient-norm growth-rate fit failed, assuming no growth: {e}")
             growth_rate = 1.0
 
         lookahead = self.config.lookahead_steps

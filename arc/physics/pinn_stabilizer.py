@@ -49,9 +49,9 @@ class AdaptiveLossBalancer:
 
         self.weights = torch.ones(n_terms) / n_terms
 
-        self._weight_history: List[torch.Tensor] = []
-        self._loss_history: List[torch.Tensor] = []
-        self._grad_history: List[torch.Tensor] = []
+        self._weight_history: deque = deque(maxlen=1000)
+        self._loss_history: deque = deque(maxlen=1000)
+        self._grad_history: deque = deque(maxlen=1000)
 
     def compute_weights(
         self,
@@ -83,16 +83,29 @@ class AdaptiveLossBalancer:
         model: nn.Module,
     ) -> torch.Tensor:
         grad_norms = []
+        accumulated_grads: Optional[List[Optional[torch.Tensor]]] = None
 
         for loss in losses:
             model.zero_grad()
             loss.backward(retain_graph=True)
 
             total_norm = 0.0
+            term_grads = []
             for param in model.parameters():
                 if param.grad is not None:
                     total_norm += param.grad.norm().item() ** 2
+                    term_grads.append(param.grad.detach().clone())
+                else:
+                    term_grads.append(None)
             grad_norms.append(np.sqrt(total_norm))
+
+            if accumulated_grads is None:
+                accumulated_grads = term_grads
+            else:
+                accumulated_grads = [
+                    g if a is None else (a if g is None else a + g)
+                    for a, g in zip(accumulated_grads, term_grads)
+                ]
 
         grad_norms = torch.tensor(grad_norms)
 
@@ -100,6 +113,14 @@ class AdaptiveLossBalancer:
 
         weights = avg_norm / (grad_norms + 1e-10)
         weights = weights / weights.sum()
+
+        # restore the accumulated (summed) per-term gradients, so a
+        # subsequent optimizer.step() sees the total gradient rather than
+        # only the last loss term's.
+        model.zero_grad()
+        for param, grad in zip(model.parameters(), accumulated_grads or []):
+            if grad is not None:
+                param.grad = grad
 
         self._grad_history.append(grad_norms)
 
@@ -272,7 +293,7 @@ class PINNStabilizer:
         self.lyapunov = LyapunovStabilizer(model) if use_lyapunov else None
         self.curriculum = CurriculumScheduler() if use_curriculum else None
 
-        self._diagnostics_history: List[PINNDiagnostics] = []
+        self._diagnostics_history: deque = deque(maxlen=1000)
 
     def get_stabilized_loss(
         self,

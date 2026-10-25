@@ -10,15 +10,15 @@ _ARC monitors, predicts, and recovers from training failures automatically. One 
 
 [![PyPI](https://img.shields.io/pypi/v/arc-training?style=for-the-badge&logo=pypi&logoColor=white&label=PyPI)](https://pypi.org/project/arc-training)
 [![Downloads](https://img.shields.io/pepy/dt/arc-training?style=for-the-badge&label=Downloads)](https://pepy.tech/project/arc-training)
-[![Python](https://img.shields.io/badge/Python-3.8+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org)
-[![PyTorch](https://img.shields.io/badge/PyTorch-1.9+-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)](https://pytorch.org)
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.4+-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)](https://pytorch.org)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-green?style=for-the-badge)](https://www.gnu.org/licenses/agpl-3.0)
 [![Docs](https://img.shields.io/badge/Docs-pyarc.pages.dev-orange?style=for-the-badge&logo=readthedocs&logoColor=white)](https://pyarc.pages.dev)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/E6UvPWC8DW)
 
 <br>
 
-**100% recovery** (33/33 crash scenarios) · **97.5% prediction accuracy** · **0 false interventions** · **2.6B parameters validated** (H200)
+**70/70** injected faults recovered (20/70 without ARC) · **0** rollbacks on clean runs · flags unfixable data faults instead of looping · rollback exercised at **2.65B** parameters (H200)
 
 <br>
 
@@ -71,12 +71,12 @@ pip install -e .
 ```
 
 ```bash
-pip install arc-training[lightning]
-pip install arc-training[full]
-pip install arc-training[dev]
+pip install "arc-training[hf]"          # Hugging Face Trainer callback
+pip install "arc-training[lightning]"   # Lightning callback
+pip install "arc-training[dev]"
 ```
 
-Requires Python 3.8+, PyTorch 1.9+, NumPy 1.19+, SciPy 1.7+.
+Requires Python 3.10+, PyTorch 2.4+, NumPy 1.23+, SciPy 1.9+.
 
 </details>
 
@@ -88,7 +88,31 @@ Requires Python 3.8+, PyTorch 1.9+, NumPy 1.19+, SciPy 1.7+.
 | `rolled_back` / `lr_reduced` | What ARC did in response |
 | `unrecoverable` | The fault is outside the model. Stop and fix the input pipeline |
 
-> **ARC clips gradients by default.** On healthy steps ARC clips the gradient norm to `gradient_clip_norm=1.0`. If your loop already clips, set `enable_baseline_clipping=False` in `ControllerConfig`.
+> **ARC never changes a healthy step.** It doesn't clip gradients unless you ask (`ControllerConfig(enable_baseline_clipping=True)`).
+
+<details>
+<summary><b>Mixed precision (fp16 + GradScaler), Hugging Face, Lightning</b></summary>
+
+```python
+controller = arc.Controller(model, optimizer, scaler=scaler)
+
+scaler.scale(loss).backward()
+action = controller.step(loss)      # ARC unscales; don't call scaler.unscale_()
+if not action.should_skip:
+    scaler.step(optimizer)
+    scaler.update()
+```
+
+```python
+from arc.api.integrations import HuggingFaceCallback, LightningCallback
+
+Trainer(..., callbacks=[HuggingFaceCallback()])      # transformers
+L.Trainer(..., callbacks=[LightningCallback()])      # lightning
+```
+
+Both callbacks check each step before the optimizer runs and skip a poisoned update.
+
+</details>
 
 Full guide: **[pyarc.pages.dev/docs.html](https://pyarc.pages.dev/docs.html)**
 
@@ -98,10 +122,10 @@ Full guide: **[pyarc.pages.dev/docs.html](https://pyarc.pages.dev/docs.html)**
 
 **Training neural networks is fragile.** A single NaN gradient at hour 47 of a 48-hour run can destroy days of compute. Engineers waste enormous time adding manual checkpointing and babysitting long runs.
 
-- **NaN explosions** - loss becomes NaN or Inf with no warning, corrupting the run irreversibly.
-- **Gradient collapse** - vanishing or exploding gradients silently halt learning, wasting compute without any alert.
-- **Wasted compute** - cloud GPU spending exceeds $30B annually. Every unrecoverable failure burns money directly.
-- **Manual monitoring** - engineers watch training overnight, writing custom recovery scripts and checkpointing logic.
+- **NaN explosions:** the loss becomes NaN or Inf with no warning and corrupts the run.
+- **Gradient collapse:** vanishing or exploding gradients stop learning without any alert.
+- **Wasted compute:** every failure you can't recover from burns GPU-hours you already paid for.
+- **Manual monitoring:** engineers watch runs overnight and write their own recovery scripts and checkpointing logic.
 
 ---
 
@@ -110,8 +134,8 @@ Full guide: **[pyarc.pages.dev/docs.html](https://pyarc.pages.dev/docs.html)**
 | | Stage | What happens |
 | :-: | :--- | :--- |
 | **01** | **Monitor** | Checks every step for NaN/Inf, loss explosions, gradient explosions, and weight corruption. Thresholds auto-calibrate to your model during the first 50 steps. |
-| **02** | **Predict** | Lyapunov stability and trend-drift detectors flag instability 26-101 steps before the loss diverges. The MLP failure classifier reaches 97.5% accuracy with zero false positives. |
-| **03** | **Recover** | Restores model, optimizer, and RNG state from the last healthy checkpoint, then cuts the learning rate. If a fault keeps coming back from the data, ARC says so and marks the run unrecoverable instead of looping. |
+| **02** | **Predict** | Lyapunov stability and trend-drift detectors flag rising instability before loss-based checks fire. Velocity is measured per unit of learning rate, so a warmup schedule isn't mistaken for divergence. |
+| **03** | **Recover** | Restores model, optimizer, and RNG state from the last validated snapshot, then cuts the learning rate. A failure counts as recovered only after 10 healthy steps. If a fault keeps coming back from the data, ARC says so and marks the run unrecoverable instead of looping. |
 
 ```text
 Controller.step(loss)
@@ -120,17 +144,20 @@ Controller.step(loss)
     +-- NaN / Inf loss                    immediate
     +-- loss explosion                    absolute threshold + 10x spike vs recent mean
     +-- NaN / Inf weights, weight health  every 10 steps: sparsity, magnitude collapse
-    +-- gradient explosion                norm threshold, then baseline clipping
+    +-- NaN / Inf gradients               true scale (GradScaler-aware)
+    +-- gradient explosion                norm threshold (clipping only if enabled)
     +-- Lyapunov divergence               predictive, every 5 steps
     +-- trend drift                       OLS slope over a sliding window
+    +-- DDP: every rank agrees            one all-reduce, so replicas never diverge
     |
-    +--[FAILURE]--> restore checkpoint (model + optimizer + RNG)
-    |               reduce LR x0.5 (re-applied after every restore)
-    |               5 rollbacks within a few steps -> escape: oldest checkpoint,
+    +--[FAILURE]--> restore snapshot (model + optimizer + RNG), skip the step
+    |               reduce LR x0.5 (undone after 500 healthy steps)
+    |               5 rollbacks within a few steps -> escape: oldest snapshot,
     |                   perturb weights, 2 extra LR cuts, skip 5 steps
     |               3 escapes with no progress -> unrecoverable (warns once)
     |
-    +--[HEALTHY]--> update history, adaptive checkpoint
+    +--[HEALTHY]--> snapshot copied async after optimizer.step(),
+                    kept once the next step passes; adaptive frequency
 ```
 
 ---
@@ -139,17 +166,17 @@ Controller.step(loss)
 
 | Capability | Description |
 | :--- | :--- |
-| **Unified Controller** | One entry point, `arc.Controller`, replaces five legacy APIs. Rollback, learning-rate ratcheting, scheduler sync, and gradient clipping in a single `step()` call. |
-| **Lyapunov Early Warning** | Online Lyapunov exponent estimation with FFT oscillation detection catches instability 26-101 steps before loss-based detection. |
+| **Unified Controller** | One entry point, `arc.Controller`, replaces five legacy APIs. Rollback, learning-rate ratcheting and recovery, scheduler sync (including OneCycleLR), GradScaler support, and resumable `save_checkpoint()` / `load_checkpoint()`. |
+| **Lyapunov Early Warning** | Online, learning-rate-normalized Lyapunov exponent estimation on a fixed parameter sample, with FFT oscillation detection. |
 | **Trend Drift Detection** | Sliding-window regression on loss, gradient, and weight norms catches slow numerical drift that threshold checks miss. |
 | **Auto-Calibration** | Learns loss and gradient thresholds from your model's first 50 steps, so you never have to guess what "too high" means. |
 | **Honest Failure Handling** | When a fault lives in the data (a NaN row, `log(0)`, a zero-variance batch), ARC stops claiming recovery, raises one warning, and names the likely cause. |
-| **Recovery Ledger and ROI** | A hash-chained, tamper-evident log of every intervention, exportable as JSON, with GPU-hours, dollars, and carbon saved per run, team, and project. |
+| **Recovery Ledger and ROI** | A hash-chained log of every intervention (HMAC-keyed with `ledger_key`), exportable as JSON. Work lost per rollback is always recorded; GPU-hours, dollars, and carbon saved are measured against your durable-checkpoint interval (`baseline_checkpoint_interval`) and roll up per team and project. |
 | **Checkpoint Integrity** | SHA-256 and HMAC signing on every storage strategy, verified on restore, plus a disaster-recovery drill that proves a checkpoint restores correctly. |
 | **Policy Engine and Alerts** | Declarative remediation rules over failure predictions with a dry-run approval gate, and a severity-stacked alert router with de-duplication. |
 | **RL and Generation Stability** | Detectors for KL blowup, entropy collapse, reward hacking, advantage explosion, mode collapse, and n-gram repetition in rollouts. |
 | **Distributed Health Signals** | Straggler detection across ranks, cross-replica gradient checks for silent data corruption, and bit-reproducibility reports. |
-| **Async Checkpointing** | CPU-offloaded, background-thread checkpoints with adaptive frequency: more often when training is unstable, less often when it is calm. |
+| **Async Checkpointing** | Right after `optimizer.step()`, a background thread copies the snapshot to host memory on a side CUDA stream, overlapping the next forward and backward pass. Frequency adapts: more often when training is unstable, less often when it is calm. |
 | **Research Toolkit** | PINN stabilizer, conformal uncertainty, adversarial detection, and EWC continual learning ship in the same package. |
 
 Examples for CNNs, YOLO, Transformers, LLM fine-tuning, PINNs, RL, and more: **[pyarc.pages.dev/examples.html](https://pyarc.pages.dev/examples.html)**
@@ -197,10 +224,10 @@ arc/
   learning/        Failure meta-model, EWC
 ```
 
-- **One canonical entry point** - `Controller.step(loss)` runs every detector in order and returns a `StepAction` with health status, failure type, and what ARC did about it.
-- **Toggleable signals** - Lyapunov, trend, gradient, and weight-health monitors switch on or off independently in `ControllerConfig`, without touching recovery logic.
-- **Auditable by default** - every intervention lands in a hash-chained ledger you can export, verify, diff across runs, and roll up per team.
-- **Minimal dependencies** - requires PyTorch, NumPy, and SciPy. Optional integrations for Lightning, Hugging Face, and Weights & Biases.
+- **One canonical entry point:** `Controller.step(loss)` runs every detector in order and returns a `StepAction` with the health status, the failure type, and what ARC did about it.
+- **Toggleable signals:** the Lyapunov, trend, gradient, and weight-health monitors switch on or off independently in `ControllerConfig`, without touching recovery logic.
+- **Auditable by default:** every intervention lands in a hash-chained ledger you can export, verify, compare across runs, and roll up per team.
+- **Minimal dependencies:** PyTorch, NumPy, and SciPy. Optional integrations for Lightning, Hugging Face, and Weights & Biases.
 
 **Works with any architecture:** CNN / ResNet, Transformers, YOLO / ViT, PINNs, GPT / LLMs, Diffusion UNet, RNN / LSTM, GANs.
 
@@ -216,18 +243,25 @@ Validated on GPT-2 Medium, Large, and XL (1.5B), a 2.6B-parameter custom transfo
 
 ## Benchmarks
 
-Every number comes from a reproducible script in [`experiments/`](https://github.com/a-kaushik2209/ARC/tree/master/experiments) or from the ARC research paper.
+Every number comes from a script in [`experiments/`](https://github.com/a-kaushik2209/ARC/tree/master/experiments) that you can re-run.
 
-### Recovery across test suites
+### Fault-injection recovery (ARC 5.2.0)
 
-| Test Suite | Scenarios | Baseline Crashes | ARC Recovered | Recovery Rate |
+[`experiments/recovery_benchmark.py`](https://github.com/a-kaushik2209/ARC/blob/master/experiments/recovery_benchmark.py), 5 seeds, CPU. Each trial trains the same MLP on the same data twice, once unprotected and once with `arc.Controller`, and injects the same fault at step 60 of 150. Both runs are judged by the same checks at the end: no exception, every weight finite, and held-out loss no more than 2x its pre-fault value.
+
+| Fault class | Trials | Healthy without ARC | Healthy with ARC | ARC rollbacks |
 | :--- | :-: | :-: | :-: | :-: |
-| Nightmare Stress | 16 | 14 | 14 | 100% |
-| Comprehensive | 38 | 13 | 13 | 100% |
-| Silent Failure | 13 | 6 (detectable) | 6 | 100% |
-| **Combined** | **67** | **33** | **33** | **100%** |
+| No fault (control) | 5 | 5 | 5 | **0** |
+| Transient: 14 types (NaN/Inf loss, x1e10 spikes, NaN weights or optimizer state, LR set to 1e6, Inf and adversarial gradients, repeated bursts) | 70 | 20 | **70** | 173 |
+| Persistent bad data (NaN in every batch; x1e15 loss every 10th step) | 10 | 5 | **10** | 305 |
 
-### Baseline comparison
+Under persistent NaN data, rollback can't fix the input. In all 5 trials ARC kept the model intact and flagged the run unrecoverable instead of looping. In 20 transient trials ARC rolled back for a fault that unprotected Adam would have absorbed (for example a x1e10 loss spike). That cost a few steps but never left a worse model. The control group is small; false-positive rates on full-size training recipes have not been measured yet.
+
+### Results from ARC 5.1 scripts (pending re-measurement)
+
+An October 2026 audit found that the 5.1 stress suites (Nightmare, Comprehensive, Silent Failure) never applied their crash checks to the ARC-protected run, so their "100% recovered" figures meant "didn't raise an exception". Those suites are superseded by the benchmark above. The tables below come from 5.1 code (some from legacy APIs). They are kept for reference until they're re-run on 5.2.
+
+#### Baseline comparison
 
 | Method | Detection | Recovery | False Pos. |
 | :--- | :-: | :-: | :-: |
@@ -236,9 +270,9 @@ Every number comes from a reproducible script in [`experiments/`](https://github
 | Loss-Only Monitor | 80.0% | 80.0% | 0 |
 | **Full ARC** | **100%** | **100%** | **0** |
 
-### Billion-scale validation (NVIDIA H200)
+#### Billion-scale rollback (NVIDIA H200)
 
-NaN loss injected at step 30.
+A 60-step fine-tune with one NaN loss injected at step 30, using the legacy `WeightRollback`. The unprotected run is stopped at the NaN by the script, so this shows that rollback fits and runs at 2.65B parameters, not a recovery rate.
 
 | Model | Params | No Protection | ARC | Rollbacks |
 | :--- | :-: | :-: | :-: | :-: |
@@ -247,29 +281,31 @@ NaN loss injected at step 30.
 | GPT-2 XL | 1.56B | Crashed at step 30 | Recovered | 1 |
 | Custom Transformer | 2.65B | Crashed at step 30 | Recovered | 1 |
 
-### Real-dataset recovery
+#### Real-dataset recovery
 
 | Experiment | Clean Baseline | ARC-Protected (failure injected) |
 | :--- | :-: | :-: |
 | CIFAR-10, ResNet-18 (3 seeds) | 77.43% ± 0.12 | 77.42% ± 0.15 |
 | GPT-2 (124M) on WikiText-2, perplexity | 15.8 | 16.4 |
 
-### Failure prediction
+#### Failure prediction (research)
+
+Classifiers trained and tested on simulated training curves. No trained predictor ships with the package, so `FailurePredictor` reports `risk_level="unknown"` unless you load your own model.
 
 | Classifier | Accuracy | Precision | Recall | F1 |
 | :--- | :-: | :-: | :-: | :-: |
 | Logistic Regression (12 features) | 95.5% | 100% | 91.0% | 0.953 |
 | **MLP (12 features)** | **97.5% ± 2.2** | **100%** | **95%** | **0.974** |
 
-### Overhead (CPU)
+### Overhead (GPU)
 
-| Model | Parameters | ARC (ms) | Baseline (ms) | Relative |
-| :--- | :-: | :-: | :-: | :-: |
-| Small MLP | 50K | 0.86 | 1.45 | ~60% |
-| Medium CNN | 288K | 1.38 | 14.17 | ~10% |
-| Large CNN | 2.5M | 7.04 | 74.24 | ~9.5% |
+Measured with `experiments/controller_overhead.py`: GPT-2 (124M, random init), batch 4, sequence 128, AdamW, 400 steps in interleaved blocks of 50 (median step time).
 
-End-to-end GPU overhead on a Tesla T4 is 40.7% (GPT-2, 124M) and 33.4% (GPT-2 Medium, 355M). Relative overhead falls as models grow.
+| GPU | Baseline (ms/step) | With ARC (ms/step) | Overhead |
+| :--- | :-: | :-: | :-: |
+| RTX 3050 6GB Laptop | 255.86 | 261.49 | **2.2%** |
+
+Reproduce: `python experiments/controller_overhead.py --steps 400 --batch 4 --seq 128`
 
 Full results, protocols, and ablations: **[pyarc.pages.dev/benchmarks.html](https://pyarc.pages.dev/benchmarks.html)**
 
@@ -279,11 +315,12 @@ Full results, protocols, and ablations: **[pyarc.pages.dev/benchmarks.html](http
 
 | Area | Status |
 | :--- | :--- |
-| GPU overhead | 33-41% end-to-end on T4 for 124M-355M models. Not yet profiled on H100/H200 |
-| Scale | Recovery validated up to 2.65B parameters on a single H200. Checkpoint snapshots need memory headroom |
+| GPU overhead | 2.2% on GPT-2 (124M) on an RTX 3050. Not yet profiled on A100/H100/H200 or at multi-billion scale |
+| Scale | Rollback exercised at 2.65B parameters on one H200 (5.1, legacy engine). Snapshots live in host RAM: plan for `max_checkpoints` (3) copies of model plus optimizer state |
 | Organic failures | Partially tested (8-scenario harness, realistic bugs on ResNet-50). Long-duration organic runs at scale are untested |
 | Data faults | Detected but not repairable by rollback. ARC flags them unrecoverable and names the likely cause |
-| Distributed training | Recovery runs single-process. DDP rollback, straggler, and SDC algorithms exist but are not yet validated on a live multi-node cluster |
+| Distributed training | `Controller` supports DDP: every rank agrees on each rollback (tested with 2 processes). FSDP/DTensor models are refused with a clear error. Multi-node, straggler, and SDC paths are not yet validated on a live cluster |
+| Framework callbacks | The Hugging Face and Lightning hooks don't receive the loss, so they check gradients, weights and dynamics; with the trainers' default clipping, a finite exploding gradient is clipped before ARC sees it (NaN/Inf is still caught) |
 | Multiplicative weight corruption | Scaling all weights (e.g. 1000x) without producing NaN or sparsity is not caught |
 | Frameworks | PyTorch only |
 

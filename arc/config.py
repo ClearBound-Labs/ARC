@@ -65,7 +65,12 @@ class SignalConfig:
     curvature_hvp_samples: int = 5
 
     track_effective_rank: bool = True
-    effective_rank_sample_size: int = 100
+    # Rank of the truncated SVD backing effective rank. This is a *detector* for
+    # rank collapse, not a spectral analysis: 32 components resolve a collapse
+    # toward single digits perfectly well, whereas q=100 approached a full SVD
+    # on typical conv weights and made this signal cost more per collection than
+    # the training step it was measuring.
+    effective_rank_sample_size: int = 32
 
     def __post_init__(self):
         if not (0 < self.activation_sample_ratio <= 1):

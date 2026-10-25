@@ -74,6 +74,14 @@ class BenchmarkResult:
         )
 
 class BenchmarkSuite:
+    """Benchmarks the rule-based `TrajectoryLabeler` against simulated
+    trajectories whose failure mode is known, plus the legacy `Arc` API's
+    overhead.
+
+    It does not measure `arc.Controller` on real training runs, and its
+    numbers must not be quoted as ARC's detection accuracy.
+    """
+
     def __init__(
         self,
         config: Optional[Config] = None,
@@ -147,7 +155,7 @@ class BenchmarkSuite:
         runtime = time.time() - start_time
 
         return BenchmarkResult(
-            name="Detection Accuracy",
+            name="Labeler Detection Accuracy (synthetic)",
             metrics=metrics,
             runtime_seconds=runtime,
             config=self.config.to_dict(),
@@ -188,7 +196,7 @@ class BenchmarkSuite:
         runtime = time.time() - start_time
 
         return BenchmarkResult(
-            name="Early Warning",
+            name="Labeler Early Warning (synthetic)",
             metrics=metrics,
             runtime_seconds=runtime,
             config=self.config.to_dict(),
@@ -226,7 +234,7 @@ class BenchmarkSuite:
         runtime = time.time() - start_time
 
         return BenchmarkResult(
-            name="False Alarm Rate",
+            name="Labeler False Alarm Rate (synthetic)",
             metrics=metrics,
             runtime_seconds=runtime,
             config=self.config.to_dict(),
@@ -263,7 +271,7 @@ class BenchmarkSuite:
         runtime = time.time() - start_time
 
         return BenchmarkResult(
-            name="Calibration",
+            name="Labeler Calibration (synthetic)",
             metrics=metrics,
             runtime_seconds=runtime,
             config=self.config.to_dict(),

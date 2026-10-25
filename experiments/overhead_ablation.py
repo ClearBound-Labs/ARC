@@ -51,6 +51,8 @@ class AblationResult:
 
 class TestModel(nn.Module):
     """Medium-sized model for overhead testing."""
+    __test__ = False  # not a pytest test class, just named "Test*"
+
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(

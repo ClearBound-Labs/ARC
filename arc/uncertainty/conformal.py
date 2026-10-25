@@ -50,12 +50,16 @@ class ConformalPredictor:
         alpha: float = 0.1,
         score_function: str = "aps",
         adaptive: bool = True,
+        raps_k_reg: int = 2,
+        raps_lambda_reg: float = 0.001,
     ):
 
         self.model = model
         self.alpha = alpha
         self.score_function = score_function
         self.adaptive = adaptive
+        self.raps_k_reg = raps_k_reg
+        self.raps_lambda_reg = raps_lambda_reg
 
         self._calibration_scores: List[float] = []
         self._quantile: Optional[float] = None
@@ -136,10 +140,8 @@ class ConformalPredictor:
             sorted_probs, sorted_idx = probs.sort(dim=-1, descending=True)
             cumsum = sorted_probs.cumsum(dim=-1)
 
-            k_reg = 2
-            lambda_reg = 0.001
             positions = torch.arange(probs.size(-1), device=probs.device)
-            regularization = lambda_reg * torch.clamp(positions - k_reg, min=0)
+            regularization = self.raps_lambda_reg * torch.clamp(positions - self.raps_k_reg, min=0)
 
             cumsum_reg = cumsum + regularization
 
@@ -188,8 +190,14 @@ class ConformalPredictor:
             if self.score_function == "lac":
                 set_members = (sample_probs >= 1 - self._quantile).nonzero().squeeze(-1).tolist()
             else:
+                if self.score_function == "raps":
+                    positions = torch.arange(n_classes, device=sample_probs.device)
+                    regularization = self.raps_lambda_reg * torch.clamp(positions - self.raps_k_reg, min=0)
+                    set_cumsum = cumsum + regularization
+                else:
+                    set_cumsum = cumsum
 
-                n_include = (cumsum <= self._quantile).sum().item() + 1
+                n_include = (set_cumsum <= self._quantile).sum().item() + 1
                 n_include = min(n_include, n_classes)
                 set_members = sorted_idx[:n_include].tolist()
 

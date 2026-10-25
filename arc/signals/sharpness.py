@@ -16,14 +16,35 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with ARC. If not, see <https://www.gnu.org/licenses/>.
 
-from typing import Dict, Any, Optional, List, Tuple
+"""Loss-landscape sharpness probes (research module).
+
+Every probe uses ``torch.autograd.grad`` on its own probe batch, so it never
+touches the caller's accumulated ``.grad`` and restores the model's
+train/eval mode and weights exactly.
+"""
+
+from typing import Dict, Any, Optional, List
+import time
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from arc.signals.base import SignalCollector, SignalSnapshot
 from arc.config import SignalConfig
+
+
+def _trainable(model: nn.Module) -> List[torch.Tensor]:
+    return [p for p in model.parameters() if p.requires_grad]
+
+
+def _hvp(model: nn.Module, loss_fn, inputs, targets, vectors: List[torch.Tensor]):
+    """Hessian-vector product of the probe loss with `vectors`."""
+    params = _trainable(model)
+    loss = loss_fn(model(inputs), targets)
+    grads = torch.autograd.grad(loss, params, create_graph=True, allow_unused=True)
+    gv = sum((g * v).sum() for g, v in zip(grads, vectors) if g is not None)
+    return torch.autograd.grad(gv, params, allow_unused=True)
+
 
 class SharpnessCollector(SignalCollector):
 
@@ -66,21 +87,16 @@ class SharpnessCollector(SignalCollector):
         if model is None:
             return {}
 
-        self._hessian_trace = self._hutchinson_trace(
-            model, loss_fn, inputs, targets
-        )
-
-        self._max_eigenvalue = self._power_iteration_max_eig(
-            model, loss_fn, inputs, targets
-        )
-
-        self._gradient_curvature = self._gradient_direction_curvature(
-            model, loss_fn, inputs, targets
-        )
-
-        self._sam_sharpness = self._sam_perturbation_sharpness(
-            model, loss_fn, inputs, targets
-        )
+        was_training = model.training
+        model.eval()
+        try:
+            self._hessian_trace = self._hutchinson_trace(model, loss_fn, inputs, targets)
+            self._max_eigenvalue = self._power_iteration_max_eig(model, loss_fn, inputs, targets)
+            self._gradient_curvature = self._gradient_direction_curvature(
+                model, loss_fn, inputs, targets)
+            self._sam_sharpness = self._sam_perturbation_sharpness(model, loss_fn, inputs, targets)
+        finally:
+            model.train(was_training)
 
         if self._max_eigenvalue > 1e-10:
             self._flatness_ratio = self._hessian_trace / self._max_eigenvalue
@@ -96,245 +112,94 @@ class SharpnessCollector(SignalCollector):
             "flatness_ratio": self._flatness_ratio,
         }
 
-    def _hutchinson_trace(
-        self,
-        model: nn.Module,
-        loss_fn: callable,
-        inputs: torch.Tensor,
-        targets: torch.Tensor,
-    ) -> float:
-
-        model.eval()
+    def _hutchinson_trace(self, model, loss_fn, inputs, targets) -> float:
         traces = []
-
         for _ in range(self.num_hutchinson_samples):
-
-            v = []
-            for p in model.parameters():
-                if p.requires_grad:
-                    v.append(torch.randint_like(p, 0, 2) * 2.0 - 1.0)
-
-            model.zero_grad()
-            outputs = model(inputs)
-            loss = loss_fn(outputs, targets)
-
-            grads = torch.autograd.grad(
-                loss,
-                [p for p in model.parameters() if p.requires_grad],
-                create_graph=True,
-                allow_unused=True,
-            )
-
-            gv = sum(
-                (g * vi).sum()
-                for g, vi in zip(grads, v)
-                if g is not None
-            )
-
-            hvp = torch.autograd.grad(
-                gv,
-                [p for p in model.parameters() if p.requires_grad],
-                retain_graph=False,
-                allow_unused=True,
-            )
-
-            vhv = sum(
-                (vi * hv).sum().item()
-                for vi, hv in zip(v, hvp)
-                if hv is not None
-            )
-
-            traces.append(vhv)
-
-        model.train()
+            v = [torch.randint_like(p, 0, 2) * 2.0 - 1.0 for p in _trainable(model)]
+            hvp = _hvp(model, loss_fn, inputs, targets, v)
+            traces.append(sum(
+                (vi * hv).sum().item() for vi, hv in zip(v, hvp) if hv is not None
+            ))
         return float(np.mean(traces))
 
-    def _power_iteration_max_eig(
-        self,
-        model: nn.Module,
-        loss_fn: callable,
-        inputs: torch.Tensor,
-        targets: torch.Tensor,
-    ) -> float:
-
-        model.eval()
-
+    def _power_iteration_max_eig(self, model, loss_fn, inputs, targets) -> float:
         v = []
-        for p in model.parameters():
-            if p.requires_grad:
-                vi = torch.randn_like(p)
-                vi = vi / (vi.norm() + 1e-10)
-                v.append(vi)
+        for p in _trainable(model):
+            vi = torch.randn_like(p)
+            v.append(vi / (vi.norm() + 1e-10))
 
         for _ in range(self.power_iterations):
-
-            model.zero_grad()
-            outputs = model(inputs)
-            loss = loss_fn(outputs, targets)
-
-            grads = torch.autograd.grad(
-                loss,
-                [p for p in model.parameters() if p.requires_grad],
-                create_graph=True,
-                allow_unused=True,
-            )
-
-            gv = sum(
-                (g * vi).sum()
-                for g, vi in zip(grads, v)
-                if g is not None
-            )
-
-            hvp = torch.autograd.grad(
-                gv,
-                [p for p in model.parameters() if p.requires_grad],
-                retain_graph=False,
-                allow_unused=True,
-            )
-
-            hvp_list = [hv if hv is not None else torch.zeros_like(vi) for hv, vi in zip(hvp, v)]
-            total_norm = sum((hv ** 2).sum() for hv in hvp_list).sqrt()
-
+            hvp = _hvp(model, loss_fn, inputs, targets, v)
+            hvp = [hv if hv is not None else torch.zeros_like(vi) for hv, vi in zip(hvp, v)]
+            total_norm = sum((hv ** 2).sum() for hv in hvp).sqrt()
             if total_norm > 1e-10:
-                v = [hv / total_norm for hv in hvp_list]
+                v = [hv / total_norm for hv in hvp]
 
-        model.zero_grad()
-        outputs = model(inputs)
-        loss = loss_fn(outputs, targets)
-
-        grads = torch.autograd.grad(
-            loss,
-            [p for p in model.parameters() if p.requires_grad],
-            create_graph=True,
-            allow_unused=True,
-        )
-
-        gv = sum(
-            (g * vi).sum()
-            for g, vi in zip(grads, v)
-            if g is not None
-        )
-
-        hvp = torch.autograd.grad(
-            gv,
-            [p for p in model.parameters() if p.requires_grad],
-            retain_graph=False,
-            allow_unused=True,
-        )
-
-        eigenvalue = sum(
-            (vi * hv).sum().item()
-            for vi, hv in zip(v, hvp)
-            if hv is not None
-        )
-
-        model.train()
+        hvp = _hvp(model, loss_fn, inputs, targets, v)
+        eigenvalue = sum((vi * hv).sum().item() for vi, hv in zip(v, hvp) if hv is not None)
         return float(max(0, eigenvalue))
 
-    def _gradient_direction_curvature(
-        self,
-        model: nn.Module,
-        loss_fn: callable,
-        inputs: torch.Tensor,
-        targets: torch.Tensor,
-    ) -> float:
-
-        model.eval()
-        model.zero_grad()
-
-        outputs = model(inputs)
-        loss = loss_fn(outputs, targets)
-
-        grads = torch.autograd.grad(
-            loss,
-            [p for p in model.parameters() if p.requires_grad],
-            create_graph=True,
-            allow_unused=True,
-        )
+    def _gradient_direction_curvature(self, model, loss_fn, inputs, targets) -> float:
+        params = _trainable(model)
+        loss = loss_fn(model(inputs), targets)
+        grads = torch.autograd.grad(loss, params, create_graph=True, allow_unused=True)
 
         grad_norm_sq = sum((g ** 2).sum() for g in grads if g is not None)
-
         if grad_norm_sq < 1e-10:
-            model.train()
             return 0.0
 
-        gg = sum((g ** 2).sum() for g in grads if g is not None)
-
-        hvp = torch.autograd.grad(
-            gg,
-            [p for p in model.parameters() if p.requires_grad],
-            retain_graph=False,
-            allow_unused=True,
-        )
-
+        hvp = torch.autograd.grad(grad_norm_sq, params, allow_unused=True)
         curvature = 0.5 * sum(
             (g * hv).sum().item()
             for g, hv in zip(grads, hvp)
             if g is not None and hv is not None
         ) / grad_norm_sq.item()
-
-        model.train()
         return float(curvature)
 
-    def _sam_perturbation_sharpness(
-        self,
-        model: nn.Module,
-        loss_fn: callable,
-        inputs: torch.Tensor,
-        targets: torch.Tensor,
-    ) -> float:
+    def _sam_perturbation_sharpness(self, model, loss_fn, inputs, targets) -> float:
+        params = _trainable(model)
+        with torch.enable_grad():
+            loss_original = loss_fn(model(inputs), targets)
+            grads = torch.autograd.grad(loss_original, params, allow_unused=True)
 
-        model.eval()
-
-        model.zero_grad()
-        outputs = model(inputs)
-        loss_original = loss_fn(outputs, targets)
-        loss_original.backward()
-
-        original_params = {}
-        grad_norm = 0.0
-
-        for name, p in model.named_parameters():
-            if p.grad is not None:
-                original_params[name] = p.data.clone()
-                grad_norm += (p.grad ** 2).sum().item()
-
-        grad_norm = np.sqrt(grad_norm) + 1e-10
+        grad_norm = float(np.sqrt(sum((g ** 2).sum().item() for g in grads if g is not None))) + 1e-10
+        originals = [p.detach().clone() for p in params]
 
         with torch.no_grad():
-            for name, p in model.named_parameters():
-                if p.grad is not None:
-                    p.data += self.perturbation_radius * p.grad / grad_norm
+            for p, g in zip(params, grads):
+                if g is not None:
+                    p.add_(self.perturbation_radius * g / grad_norm)
+            loss_perturbed = loss_fn(model(inputs), targets)
+            for p, original in zip(params, originals):
+                p.copy_(original)
 
-        with torch.no_grad():
-            outputs_perturbed = model(inputs)
-            loss_perturbed = loss_fn(outputs_perturbed, targets)
+        return float(max(0, loss_perturbed.item() - loss_original.item()))
 
-        with torch.no_grad():
-            for name, p in model.named_parameters():
-                if name in original_params:
-                    p.data = original_params[name]
+    def _register_hooks(self) -> None:
+        # No forward/backward hooks needed: sharpness metrics require an
+        # explicit compute_sharpness(loss_fn, inputs, targets) call (Hessian
+        # products need a fresh forward pass), not hook-driven collection.
+        pass
 
-        sharpness = loss_perturbed.item() - loss_original.item()
-
-        model.train()
-        return float(max(0, sharpness))
-
-    def collect(self) -> SignalSnapshot:
-
-        signals = {
-            "sharpness": {
-                "hessian_trace": self._hessian_trace,
-                "hessian_trace_ema": self._trace_ema,
-                "max_eigenvalue": self._max_eigenvalue,
-                "max_eigenvalue_ema": self._max_eig_ema,
-                "gradient_curvature": self._gradient_curvature,
-                "sam_sharpness": self._sam_sharpness,
-                "flatness_ratio": self._flatness_ratio,
-            }
+    def _collect_signals(self) -> Dict[str, Any]:
+        return {
+            "hessian_trace": self._hessian_trace,
+            "hessian_trace_ema": self._trace_ema,
+            "max_eigenvalue": self._max_eigenvalue,
+            "max_eigenvalue_ema": self._max_eig_ema,
+            "gradient_curvature": self._gradient_curvature,
+            "sam_sharpness": self._sam_sharpness,
+            "flatness_ratio": self._flatness_ratio,
         }
 
-        return SignalSnapshot(signals=signals, overhead_ms=0)
+    def collect(self) -> SignalSnapshot:
+        return SignalSnapshot(
+            step=self._step,
+            epoch=self._epoch,
+            timestamp=time.time(),
+            signals={"sharpness": self._collect_signals()},
+            metadata=self._get_metadata(),
+        )
 
     def reset(self) -> None:
 

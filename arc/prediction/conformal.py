@@ -37,6 +37,7 @@ class ConformalPredictor:
         self,
         target_coverage: float = 0.9,
         score_type: str = "aps",
+        random_state: Optional[int] = None,
     ):
 
         self.target_coverage = target_coverage
@@ -46,6 +47,7 @@ class ConformalPredictor:
         self._threshold: Optional[float] = None
         self._calibration_scores: Optional[np.ndarray] = None
         self._n_cal: int = 0
+        self._rng = np.random.default_rng(random_state)
 
     def calibrate(
         self,
@@ -78,21 +80,19 @@ class ConformalPredictor:
 
         elif self.score_type == "aps":
 
-            n_samples, n_classes = probs.shape
-            scores = np.zeros(n_samples)
+            n_samples = len(labels)
+            row = np.arange(n_samples)
 
-            for i in range(n_samples):
+            sorted_idx = np.argsort(-probs, axis=1)
+            sorted_probs = np.take_along_axis(probs, sorted_idx, axis=1)
+            cumsum = np.cumsum(sorted_probs, axis=1)
 
-                sorted_idx = np.argsort(-probs[i])
+            label_positions = np.argmax(sorted_idx == labels[:, None], axis=1)
+            cumsum_at_label = cumsum[row, label_positions]
+            prob_at_label = sorted_probs[row, label_positions]
 
-                cumsum = 0.0
-                for j, idx in enumerate(sorted_idx):
-                    if idx == labels[i]:
-
-                        u = np.random.uniform(0, 1)
-                        scores[i] = cumsum + u * probs[i, idx]
-                        break
-                    cumsum += probs[i, idx]
+            u = self._rng.uniform(0, 1, size=n_samples)
+            scores = (cumsum_at_label - prob_at_label) + u * prob_at_label
 
         else:
             raise ValueError(f"Unknown score type: {self.score_type}")

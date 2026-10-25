@@ -28,6 +28,8 @@ from arc.signals.neural_collapse import NeuralCollapseCollector
 from arc.signals.sharpness import SharpnessCollector
 from arc.signals.fisher import FisherCollector
 from arc.signals.information import InformationDynamicsCollector
+from arc.signals.lyapunov import LyapunovMonitor, LyapunovState, TrainingPhase
+from arc.signals.trend import TrendDetector, DriftReport, DriftSeverity
 
 from arc.signals.silent_detector import (
     SilentCrashDetector,
@@ -54,4 +56,11 @@ __all__ = [
     "SharpnessCollector",
     "FisherCollector",
     "InformationDynamicsCollector",
+
+    "LyapunovMonitor",
+    "LyapunovState",
+    "TrainingPhase",
+    "TrendDetector",
+    "DriftReport",
+    "DriftSeverity",
 ]

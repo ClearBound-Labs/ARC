@@ -16,6 +16,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with ARC. If not, see <https://www.gnu.org/licenses/>.
 
+import copy
+import math
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -25,6 +27,18 @@ from arc.config import default_checkpoint_dir
 import os
 import time
 import warnings
+from arc._logging import log as _log
+
+
+def _state_to_cpu(obj: Any) -> Any:
+    """Full-precision CPU copy of a (nested) optimizer state dict."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().clone()
+    if isinstance(obj, dict):
+        return {k: _state_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_state_to_cpu(v) for v in obj)
+    return copy.deepcopy(obj)
 
 @dataclass
 class UniversalDDPConfig:
@@ -44,7 +58,9 @@ class UniversalDDPConfig:
     allow_cpu_fallback: bool = True
 
     checkpoint_dir: str = default_checkpoint_dir("universal_checkpoints")
-    use_quantized_checkpoints: bool = True
+    # Opt-in: stores model *weights* as fp16 (optimizer state is always kept
+    # at full precision -- Adam's second moment underflows to 0 in fp16).
+    use_quantized_checkpoints: bool = False
 
     auto_detect_backend: bool = True
     preferred_backend: Optional[str] = None
@@ -70,6 +86,9 @@ class DistributedAction:
     step: int
     rolled_back: bool
     failure_detected: bool = False
+    # True whenever a failure was detected on any rank, rollback or not:
+    # the optimizer step must not run on poisoned gradients.
+    should_skip: bool = False
     failure_rank: int = -1
     all_ranks_synced: bool = True
     details: Dict[str, Any] = field(default_factory=dict)
@@ -91,6 +110,9 @@ class UniversalDistributedRollback:
         self._max_checkpoints = 3
 
         self._loss_history: List[float] = []
+        # Cumulative LR reduction, re-applied after every restore because
+        # load_state_dict brings the checkpoint's param_groups (lr) back.
+        self._lr_penalty: float = 1.0
         self._initial_loss: Optional[float] = None
 
         self._in_cooldown = False
@@ -121,29 +143,25 @@ class UniversalDistributedRollback:
             state.rank = 0
             state.is_main_process = True
 
-        if torch.cuda.is_available():
-            if state.is_distributed:
-                state.device = torch.device(f"cuda:{state.local_rank}")
-            else:
-                state.device = torch.device("cuda")
-        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            state.device = torch.device("mps")
-        else:
+        # Where the model actually lives, not where a GPU happens to exist.
+        try:
+            state.device = next(self.model.parameters()).device
+        except StopIteration:
             state.device = torch.device("cpu")
 
         return state
 
     def _print_init_info(self):
-        print("=" * 60)
-        print("UniversalDistributedRollback Initialized")
-        print("=" * 60)
-        print(f"   Mode: {'Distributed' if self.state.is_distributed else 'Single Device'}")
+        _log("=" * 60)
+        _log("UniversalDistributedRollback Initialized")
+        _log("=" * 60)
+        _log(f"   Mode: {'Distributed' if self.state.is_distributed else 'Single Device'}")
         if self.state.is_distributed:
-            print(f"   Backend: {self.state.backend}")
-            print(f"   World Size: {self.state.world_size}")
-            print(f"   Rank: {self.state.rank}")
-        print(f"   Device: {self.state.device}")
-        print("=" * 60)
+            _log(f"   Backend: {self.state.backend}")
+            _log(f"   World Size: {self.state.world_size}")
+            _log(f"   Rank: {self.state.rank}")
+        _log(f"   Device: {self.state.device}")
+        _log("=" * 60)
 
     def _barrier(self):
         if not self.state.is_distributed:
@@ -184,11 +202,13 @@ class UniversalDistributedRollback:
                 result["details"]["loss_ratio"] = loss_val / self._initial_loss
                 return result
 
-        total_norm = 0.0
-        for p in self.model.parameters():
-            if p.grad is not None:
-                total_norm += p.grad.norm().item() ** 2
-        total_norm = total_norm ** 0.5
+        norms = [p.grad.detach().norm() for p in self.model.parameters() if p.grad is not None]
+        total_norm = torch.linalg.vector_norm(torch.stack(norms)).item() if norms else 0.0
+
+        if self.config.nan_detection and not math.isfinite(total_norm):
+            result["detected"] = True
+            result["type"] = "nan_inf_gradients"
+            return result
 
         if total_norm > self.config.gradient_explosion_threshold:
             result["detected"] = True
@@ -216,26 +236,20 @@ class UniversalDistributedRollback:
     def _save_checkpoint(self):
         model = self.model.module if hasattr(self.model, 'module') else self.model
 
-        checkpoint = {
-            'step': self.state.step_count,
-            'model': {},
-            'optimizer': {},
-            'rng': {},
-        }
+        weights = {}
         for name, param in model.state_dict().items():
             if self.config.use_quantized_checkpoints and param.is_floating_point():
-                checkpoint['model'][name] = param.cpu().half()
+                weights[name] = param.detach().cpu().half()
             else:
-                checkpoint['model'][name] = param.cpu().clone()
+                weights[name] = param.detach().cpu().clone()
 
-        for k, v in self.optimizer.state.items():
-            checkpoint['optimizer'][k] = {
-                k2: (v2.cpu().half() if isinstance(v2, torch.Tensor) and v2.is_floating_point() and self.config.use_quantized_checkpoints
-                     else v2.cpu().clone() if isinstance(v2, torch.Tensor) else v2)
-                for k2, v2 in v.items()
-            }
-
-        checkpoint['rng']['torch'] = torch.get_rng_state()
+        checkpoint = {
+            'step': self.state.step_count,
+            'model': weights,
+            'optimizer_state_dict': _state_to_cpu(self.optimizer.state_dict()),
+            'lr_penalty': self._lr_penalty,
+            'rng': {'torch': torch.get_rng_state()},
+        }
         if torch.cuda.is_available():
             checkpoint['rng']['cuda'] = torch.cuda.get_rng_state()
 
@@ -250,32 +264,27 @@ class UniversalDistributedRollback:
         checkpoint = self._checkpoints[idx]
         model = self.model.module if hasattr(self.model, 'module') else self.model
 
-        restored_state = {}
-        for name, param in checkpoint['model'].items():
-            restored_state[name] = param.to(device=self.state.device, dtype=torch.float32)
-        model.load_state_dict(restored_state)
+        # load_state_dict copies into the live tensors, keeping their dtype.
+        model.load_state_dict({
+            name: value.to(device=self.state.device)
+            for name, value in checkpoint['model'].items()
+        })
 
-        opt_state = {}
-        for k, v in checkpoint['optimizer'].items():
-            opt_state[k] = {
-                k2: (
-                    v2.to(
-                        device=self.state.device,
-                        dtype=torch.float32 if v2.is_floating_point() else v2.dtype,
-                    )
-                    if isinstance(v2, torch.Tensor)
-                    else v2
-                )
-                for k2, v2 in v.items()
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer_state_dict = copy.deepcopy(checkpoint['optimizer_state_dict'])
+        else:  # checkpoints written before optimizer_state_dict existed
+            optimizer_state_dict = {
+                'state': copy.deepcopy(checkpoint.get('optimizer', {})),
+                'param_groups': checkpoint.get(
+                    'optimizer_param_groups', self.optimizer.state_dict()['param_groups']),
             }
-        optimizer_state_dict = {
-            'state': opt_state,
-            'param_groups': checkpoint.get(
-                'optimizer_param_groups',
-                self.optimizer.state_dict()['param_groups']  # fallback for old checkpoints
-            ),
-        }
         self.optimizer.load_state_dict(optimizer_state_dict)
+
+        # Re-apply only the LR reductions made since this checkpoint was taken.
+        ratio = self._lr_penalty / checkpoint.get('lr_penalty', 1.0)
+        if ratio != 1.0:
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] *= ratio
 
         torch.set_rng_state(checkpoint['rng']['torch'])
         if 'cuda' in checkpoint['rng'] and torch.cuda.is_available():
@@ -289,6 +298,7 @@ class UniversalDistributedRollback:
     def _reduce_learning_rate(self):
         for param_group in self.optimizer.param_groups:
             param_group['lr'] *= self.config.lr_reduction_factor
+        self._lr_penalty *= self.config.lr_reduction_factor
 
     def _coordinated_rollback(self) -> int:
         self._barrier()
@@ -315,10 +325,8 @@ class UniversalDistributedRollback:
             rolled_back=False,
         )
 
-        if self._in_cooldown:
-            if self.state.step_count >= self._cooldown_end_step:
-                self._in_cooldown = False
-            return action
+        if self._in_cooldown and self.state.step_count >= self._cooldown_end_step:
+            self._in_cooldown = False
 
         if self.state.step_count % self.config.sync_frequency == 0:
             local_failure = self._detect_local_failure(loss)
@@ -326,10 +334,15 @@ class UniversalDistributedRollback:
 
             if any_failure:
                 action.failure_detected = True
+                action.should_skip = True
+
+                if self._in_cooldown:
+                    # No second rollback this soon, but the step still must not run.
+                    return action
 
                 if self.state.rollback_count >= self.config.max_rollbacks_per_epoch:
                     if self.config.verbose and self.state.is_main_process:
-                        print("Max rollbacks reached, skipping recovery")
+                        _log("Max rollbacks reached, skipping recovery")
                     return action
 
                 steps_back = self._coordinated_rollback()
@@ -338,7 +351,7 @@ class UniversalDistributedRollback:
                 action.details['new_lr'] = self.optimizer.param_groups[0]['lr']
 
                 if self.config.verbose and self.state.is_main_process:
-                    print(f"Rollback #{self.state.rollback_count}: Restored to step {steps_back}")
+                    _log(f"Rollback #{self.state.rollback_count}: Restored to step {steps_back}")
 
         if self.state.step_count % self.config.checkpoint_frequency == 0:
             self._save_checkpoint()

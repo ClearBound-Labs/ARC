@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
+from collections import deque
 
 @dataclass
 class GeometricState:
@@ -252,7 +253,7 @@ class GeodesicTracker:
         self.geometry = geometry
         self.window_size = window_size
 
-        self._states: List[GeometricState] = []
+        self._states: deque = deque(maxlen=window_size)
         self._total_geodesic_distance: float = 0.0
         self._total_euclidean_distance: float = 0.0
 
@@ -260,8 +261,6 @@ class GeodesicTracker:
         state = self.geometry.compute_state()
 
         self._states.append(state)
-        if len(self._states) > self.window_size:
-            self._states.pop(0)
 
         self._total_geodesic_distance += state.geodesic_velocity
 

@@ -20,6 +20,10 @@
 ARC ULTIMATE COMPREHENSIVE STRESS TEST
 Testing ALL possible failure modes across every category.
 
+SUPERSEDED by experiments/recovery_benchmark.py. The ARC run here counts as
+"survived" whenever no exception is raised, even if its weights end up NaN.
+Don't quote its numbers.
+
 ============================================================
 CATEGORIES OF FAILURES COVERED:
 ============================================================
@@ -63,6 +67,8 @@ from arc.core.self_healing import SelfHealingArc, SelfHealingConfig
 
 @dataclass
 class TestResult:
+    __test__ = False  # not a pytest test class, just named "Test*"
+
     name: str
     category: str
     baseline_crashed: bool
@@ -136,6 +142,8 @@ class ComprehensiveReport:
 
 
 class TestModel(nn.Module):
+    __test__ = False  # not a pytest test class, just named "Test*"
+
     def __init__(self):
         super().__init__()
         self.fc1 = nn.Linear(100, 256)
