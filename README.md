@@ -14,7 +14,6 @@ _ARC monitors, predicts, and recovers from training failures automatically. One 
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.4+-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)](https://pytorch.org)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-green?style=for-the-badge)](https://www.gnu.org/licenses/agpl-3.0)
 [![Docs](https://img.shields.io/badge/Docs-pyarc.pages.dev-orange?style=for-the-badge&logo=readthedocs&logoColor=white)](https://pyarc.pages.dev)
-[![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/E6UvPWC8DW)
 
 <br>
 
@@ -28,7 +27,7 @@ _ARC monitors, predicts, and recovers from training failures automatically. One 
 [Examples](https://pyarc.pages.dev/examples.html) •
 [Benchmarks](https://pyarc.pages.dev/benchmarks.html) •
 [FAQ](https://pyarc.pages.dev/faq.html) •
-[Discord](https://discord.gg/E6UvPWC8DW)
+[Contact](mailto:hello@clearboundlabs.com?subject=ARC)
 
 </div>
 
@@ -326,15 +325,9 @@ Full results, protocols, and ablations: **[pyarc.pages.dev/benchmarks.html](http
 
 ---
 
-## Community
+## Contact
 
-<div align="center">
-
-[![Discord](https://img.shields.io/badge/Join%20the%20ARC%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/E6UvPWC8DW)
-
-</div>
-
-The Discord server is the primary hub for contributor discussions, development updates, research discussions, feature proposals, and debugging support. Contributors, researchers, students, and developers of all experience levels are welcome.
+Questions, feedback, research collaborations, and support: email **[hello@clearboundlabs.com](mailto:hello@clearboundlabs.com?subject=ARC)** with the subject line **ARC**. Bugs and feature requests go to [GitHub Issues](https://github.com/a-kaushik2209/ARC/issues).
 
 ## Contributing
 

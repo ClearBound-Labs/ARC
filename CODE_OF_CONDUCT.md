@@ -64,7 +64,6 @@ This Code of Conduct applies across all ARC community spaces, including but not 
 - Pull Requests
 - Discussions
 - Documentation
-- Discord channels
 - Community events
 - Social media interactions representing ARC
 - Any other project-managed communication platforms
@@ -96,7 +95,7 @@ Instances of abusive, harassing, or otherwise unacceptable behavior may be repor
 
 - GitHub Issues, when appropriate
 - Direct communication with project maintainers via GitHub
-- Official ARC community communication channels
+- Email to hello@clearboundlabs.com with the subject line "ARC"
 
 All reports will be reviewed promptly and fairly.
 
@@ -124,7 +123,7 @@ Community leaders may use the following guidelines when determining consequences
 
 **Impact:** Serious misconduct or continued violations after prior warnings.
 
-**Consequence:** Temporary suspension from participating in discussions, issues, pull requests, Discord channels, or other project activities.
+**Consequence:** Temporary suspension from participating in discussions, issues, pull requests, or other project activities.
 
 ### 4. Permanent Ban
 

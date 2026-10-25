@@ -10,6 +10,16 @@ Based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) · [Semantic V
 
 ---
 
+## [5.2.0.post1] - 2026-10-25
+
+Documentation only. No code changes besides the version number.
+
+- Questions, feedback and contribution proposals now go to
+  hello@clearboundlabs.com with the subject line "ARC"
+- Corrected the step count of the billion-scale benchmark in the README
+
+---
+
 ## [5.2.0] - 2026-10-25
 
 A correctness and honesty release from a line-by-line audit. Several defaults

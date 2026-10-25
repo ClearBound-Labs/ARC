@@ -10,7 +10,7 @@ Thanks for your interest in contributing to ARC! This guide covers everything yo
 - Wait for the issue to be **assigned to you** before starting work
 - PRs submitted without prior discussion or assignment may be closed
 
-For questions or discussions, join the [ARC Discord](https://discord.gg/E6UvPWC8DW).
+For questions, email [hello@clearboundlabs.com](mailto:hello@clearboundlabs.com?subject=ARC) with the subject line **ARC**.
 
 ---
 
@@ -111,6 +111,6 @@ Contributions aligned with these principles are strongly encouraged.
 
 ---
 
-## Community
+## Contact
 
-The [Discord server](https://discord.gg/E6UvPWC8DW) is the primary hub for contributor discussions, feature proposals, and development updates. Join us before starting larger contributions.
+Before starting a larger contribution or proposing a feature, email [hello@clearboundlabs.com](mailto:hello@clearboundlabs.com?subject=ARC) with the subject line **ARC**. Discussion of a specific change happens on its GitHub issue.

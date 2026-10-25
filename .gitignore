@@ -74,3 +74,4 @@ notebooks/
 results/
 *.ipynb
 .claude/
+.wrangler/
