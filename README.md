@@ -272,7 +272,7 @@ An October 2026 audit found that the 5.1 stress suites (Nightmare, Comprehensive
 
 #### Billion-scale rollback (NVIDIA H200)
 
-A 60-step fine-tune with one NaN loss injected at step 30, using the legacy `WeightRollback`. The unprotected run is stopped at the NaN by the script, so this shows that rollback fits and runs at 2.65B parameters, not a recovery rate.
+A 40 to 50 step fine-tune with one NaN loss injected at step 30, using the legacy `WeightRollback`. The unprotected run is stopped at the NaN by the script, so this shows that rollback fits and runs at 2.65B parameters, not a recovery rate.
 
 | Model | Params | No Protection | ARC | Rollbacks |
 | :--- | :-: | :-: | :-: | :-: |
