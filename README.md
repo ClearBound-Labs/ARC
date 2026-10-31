@@ -13,7 +13,7 @@ _ARC monitors, predicts, and recovers from training failures automatically. One 
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.4+-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)](https://pytorch.org)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-green?style=for-the-badge)](https://www.gnu.org/licenses/agpl-3.0)
-[![Docs](https://img.shields.io/badge/Docs-pyarc.pages.dev-orange?style=for-the-badge&logo=readthedocs&logoColor=white)](https://pyarc.pages.dev)
+[![Docs](https://img.shields.io/badge/Docs-arc.clearboundlabs.com-orange?style=for-the-badge&logo=readthedocs&logoColor=white)](https://arc.clearboundlabs.com/)
 
 <br>
 
@@ -21,12 +21,12 @@ _ARC monitors, predicts, and recovers from training failures automatically. One 
 
 <br>
 
-[Docs](https://pyarc.pages.dev/docs.html) •
-[API](https://pyarc.pages.dev/api.html) •
-[ARC Lens](https://pyarc.pages.dev/lens.html) •
-[Examples](https://pyarc.pages.dev/examples.html) •
-[Benchmarks](https://pyarc.pages.dev/benchmarks.html) •
-[FAQ](https://pyarc.pages.dev/faq.html) •
+[Docs](https://arc.clearboundlabs.com/docs) •
+[API](https://arc.clearboundlabs.com/api) •
+[ARC Lens](https://arc.clearboundlabs.com/lens) •
+[Examples](https://arc.clearboundlabs.com/examples) •
+[Benchmarks](https://arc.clearboundlabs.com/benchmarks) •
+[FAQ](https://arc.clearboundlabs.com/faq) •
 [Contact](mailto:hello@clearboundlabs.com?subject=ARC)
 
 </div>
@@ -113,7 +113,7 @@ Both callbacks check each step before the optimizer runs and skip a poisoned upd
 
 </details>
 
-Full guide: **[pyarc.pages.dev/docs.html](https://pyarc.pages.dev/docs.html)**
+Full guide: **[arc.clearboundlabs.com/docs](https://arc.clearboundlabs.com/docs)**
 
 ---
 
@@ -178,7 +178,7 @@ Controller.step(loss)
 | **Async Checkpointing** | Right after `optimizer.step()`, a background thread copies the snapshot to host memory on a side CUDA stream, overlapping the next forward and backward pass. Frequency adapts: more often when training is unstable, less often when it is calm. |
 | **Research Toolkit** | PINN stabilizer, conformal uncertainty, adversarial detection, and EWC continual learning ship in the same package. |
 
-Examples for CNNs, YOLO, Transformers, LLM fine-tuning, PINNs, RL, and more: **[pyarc.pages.dev/examples.html](https://pyarc.pages.dev/examples.html)**
+Examples for CNNs, YOLO, Transformers, LLM fine-tuning, PINNs, RL, and more: **[arc.clearboundlabs.com/examples](https://arc.clearboundlabs.com/examples)**
 
 ---
 
@@ -199,7 +199,7 @@ config = ControllerConfig(
 controller = Controller(model, optimizer, scheduler=scheduler, config=config)
 ```
 
-All defaults are listed in the [configuration reference](https://pyarc.pages.dev/docs.html#config).
+All defaults are listed in the [configuration reference](https://arc.clearboundlabs.com/docs#config).
 
 ---
 
@@ -236,17 +236,17 @@ Validated on GPT-2 Medium, Large, and XL (1.5B), a 2.6B-parameter custom transfo
 
 ## ARC Lens (VS Code)
 
-[ARC Lens](https://pyarc.pages.dev/lens.html) is a self-contained VS Code extension for real-time PyTorch training visualization: live losses, learning rates, gradient norms, GPU memory, and layer effective rank, plus anomaly detection and a bundled offline recovery agent. No data leaves your machine.
+[ARC Lens](https://arc.clearboundlabs.com/lens) is a self-contained VS Code extension for real-time PyTorch training visualization: live losses, learning rates, gradient norms, GPU memory, and layer effective rank, plus anomaly detection and a bundled offline recovery agent. No data leaves your machine.
 
 ---
 
 ## Benchmarks
 
-Every number comes from a script in [`experiments/`](https://github.com/a-kaushik2209/ARC/tree/master/experiments) that you can re-run.
+Every number comes from a script in [`experiments/`](https://github.com/ClearBound-Labs/ARC/tree/master/experiments) that you can re-run.
 
 ### Fault-injection recovery (ARC 5.2.0)
 
-[`experiments/recovery_benchmark.py`](https://github.com/a-kaushik2209/ARC/blob/master/experiments/recovery_benchmark.py), 5 seeds, CPU. Each trial trains the same MLP on the same data twice, once unprotected and once with `arc.Controller`, and injects the same fault at step 60 of 150. Both runs are judged by the same checks at the end: no exception, every weight finite, and held-out loss no more than 2x its pre-fault value.
+[`experiments/recovery_benchmark.py`](https://github.com/ClearBound-Labs/ARC/blob/master/experiments/recovery_benchmark.py), 5 seeds, CPU. Each trial trains the same MLP on the same data twice, once unprotected and once with `arc.Controller`, and injects the same fault at step 60 of 150. Both runs are judged by the same checks at the end: no exception, every weight finite, and held-out loss no more than 2x its pre-fault value.
 
 | Fault class | Trials | Healthy without ARC | Healthy with ARC | ARC rollbacks |
 | :--- | :-: | :-: | :-: | :-: |
@@ -306,7 +306,7 @@ Measured with `experiments/controller_overhead.py`: GPT-2 (124M, random init), b
 
 Reproduce: `python experiments/controller_overhead.py --steps 400 --batch 4 --seq 128`
 
-Full results, protocols, and ablations: **[pyarc.pages.dev/benchmarks.html](https://pyarc.pages.dev/benchmarks.html)**
+Full results, protocols, and ablations: **[arc.clearboundlabs.com/benchmarks](https://arc.clearboundlabs.com/benchmarks)**
 
 ---
 
@@ -327,7 +327,7 @@ Full results, protocols, and ablations: **[pyarc.pages.dev/benchmarks.html](http
 
 ## Contact
 
-Questions, feedback, research collaborations, and support: email **[hello@clearboundlabs.com](mailto:hello@clearboundlabs.com?subject=ARC)** with the subject line **ARC**. Bugs and feature requests go to [GitHub Issues](https://github.com/a-kaushik2209/ARC/issues).
+Questions, feedback, research collaborations, and support: email **[hello@clearboundlabs.com](mailto:hello@clearboundlabs.com?subject=ARC)** with the subject line **ARC**. Bugs and feature requests go to [GitHub Issues](https://github.com/ClearBound-Labs/ARC/issues).
 
 ## Contributing
 
@@ -335,7 +335,7 @@ Questions, feedback, research collaborations, and support: email **[hello@clearb
 2. Wait for the issue to be **assigned to you** before starting work. PRs without prior discussion or assignment may be closed.
 3. Branch, make a focused change, and open a PR that references the issue.
 
-Full workflow and standards: **[CONTRIBUTING.md](https://github.com/a-kaushik2209/ARC/blob/master/CONTRIBUTING.md)** · Release history: **[CHANGELOG.md](https://github.com/a-kaushik2209/ARC/blob/master/CHANGELOG.md)**
+Full workflow and standards: **[CONTRIBUTING.md](https://github.com/ClearBound-Labs/ARC/blob/master/CONTRIBUTING.md)** · Release history: **[CHANGELOG.md](https://github.com/ClearBound-Labs/ARC/blob/master/CHANGELOG.md)**
 
 ---
 
@@ -344,6 +344,6 @@ Full workflow and standards: **[CONTRIBUTING.md](https://github.com/a-kaushik220
 ### Built by [ClearBound Labs](https://clearboundlabs.com/)
 
 ClearBound Labs builds infrastructure that keeps intelligent systems reliable, observable, and secure.<br>
-ARC is its flagship open-source project, released under the [AGPL-3.0 License](https://github.com/a-kaushik2209/ARC/blob/master/LICENSE).
+ARC is its flagship open-source project, released under the [AGPL-3.0 License](https://github.com/ClearBound-Labs/ARC/blob/master/LICENSE).
 
 </div>
