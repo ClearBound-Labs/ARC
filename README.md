@@ -8,7 +8,7 @@ _ARC monitors, predicts, and recovers from training failures automatically. One 
 
 <br>
 
-[![PyPI](https://img.shields.io/pypi/v/arc-training?style=for-the-badge&logo=pypi&logoColor=white&label=PyPI)](https://pypi.org/project/arc-training)
+[![PyPI](https://img.shields.io/pypi/v/arc-training?cacheSeconds=3600&style=for-the-badge&logo=pypi&logoColor=white&label=PyPI)](https://pypi.org/project/arc-training)
 [![Downloads](https://img.shields.io/pepy/dt/arc-training?style=for-the-badge&label=Downloads)](https://pepy.tech/project/arc-training)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.4+-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)](https://pytorch.org)
