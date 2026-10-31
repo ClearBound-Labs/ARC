@@ -10,6 +10,14 @@ Based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) · [Semantic V
 
 ---
 
+## [5.2.0.post2] - 2026-10-31
+
+Documentation only. No code changes besides the version number.
+
+- Documentation moved to arc.clearboundlabs.com
+- Mitul added as an author
+- Removed the citation block from the README
+
 ## [5.2.0.post1] - 2026-10-25
 
 Documentation only. No code changes besides the version number.

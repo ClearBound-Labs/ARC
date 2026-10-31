@@ -4,12 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arc-training"
-version = "5.2.0.post1"
+version = "5.2.0.post2"
 description = "Automatic Recovery Controller - Auto-detect and recover from neural network training failures"
 readme = "README.md"
 license = {text = "AGPL-3.0-or-later"}
 authors = [
-    {name = "Aryan Kaushik", email = "a.kaushik0908@gmail.com"}
+    {name = "Aryan Kaushik", email = "a.kaushik0908@gmail.com"},
+    {name = "Mitul"}
 ]
 keywords = [
     "deep-learning",
@@ -57,8 +58,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://pyarc.pages.dev"
-Documentation = "https://pyarc.pages.dev/docs.html"
+Homepage = "https://arc.clearboundlabs.com"
+Documentation = "https://arc.clearboundlabs.com/docs.html"
 Repository = "https://github.com/a-kaushik2209/ARC"
 Changelog = "https://github.com/a-kaushik2209/ARC/blob/master/CHANGELOG.md"
 
