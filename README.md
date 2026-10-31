@@ -64,7 +64,7 @@ Call `controller.step(loss)` **after** `loss.backward()` and **before** `optimiz
 <summary><b>Install from source / optional extras</b></summary>
 
 ```bash
-git clone https://github.com/a-kaushik2209/ARC.git
+git clone https://github.com/ClearBound-Labs/ARC.git
 cd ARC
 pip install -e .
 ```
@@ -343,6 +343,7 @@ Full workflow and standards: **[CONTRIBUTING.md](https://github.com/ClearBound-L
 
 ### Built by [ClearBound Labs](https://clearboundlabs.com/)
 
+Created by **Aryan Kaushik** and **Mitul Gupta**.<br>
 ClearBound Labs builds infrastructure that keeps intelligent systems reliable, observable, and secure.<br>
 ARC is its flagship open-source project, released under the [AGPL-3.0 License](https://github.com/ClearBound-Labs/ARC/blob/master/LICENSE).
 

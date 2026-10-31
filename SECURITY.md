@@ -5,7 +5,7 @@
 If you discover a security issue in ARC, please report it privately via
 GitHub Security Advisories:
 
-https://github.com/a-kaushik2209/ARC/security/advisories/new
+https://github.com/ClearBound-Labs/ARC/security/advisories/new
 
 Do not file public issues for sensitive findings. For non-sensitive
 hardening (linter rules, dependency upgrades, lint of CI workflows, etc.)

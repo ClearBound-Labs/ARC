@@ -13,7 +13,7 @@ pip install "arc-training[lightning]"    # + Lightning callback
 From source, for development:
 
 ```bash
-git clone https://github.com/a-kaushik2209/ARC.git
+git clone https://github.com/ClearBound-Labs/ARC.git
 cd ARC
 pip install -e ".[dev,hf,lightning]"
 pytest tests/

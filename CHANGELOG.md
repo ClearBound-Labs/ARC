@@ -10,6 +10,13 @@ Based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) · [Semantic V
 
 ---
 
+## [5.2.0.post3] - 2026-10-31
+
+Documentation only. No code changes besides the version number.
+
+- README credits Aryan Kaushik and Mitul Gupta
+- Repository links point to github.com/ClearBound-Labs/ARC
+
 ## [5.2.0.post2] - 2026-10-31
 
 Documentation only. No code changes besides the version number.

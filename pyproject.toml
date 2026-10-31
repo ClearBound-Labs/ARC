@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arc-training"
-version = "5.2.0.post2"
+version = "5.2.0.post3"
 description = "Automatic Recovery Controller - Auto-detect and recover from neural network training failures"
 readme = "README.md"
 license = {text = "AGPL-3.0-or-later"}

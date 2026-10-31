@@ -19,7 +19,7 @@ For questions, email [hello@clearboundlabs.com](mailto:hello@clearboundlabs.com?
 ### 1. Fork and Clone
 
 ```bash
-git clone https://github.com/a-kaushik2209/ARC.git
+git clone https://github.com/ClearBound-Labs/ARC.git
 cd ARC
 ```
 
