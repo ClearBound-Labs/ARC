@@ -16,7 +16,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with ARC. If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "5.2.0.post1"
+__version__ = "5.2.0.post2"
 __author__ = "Aryan Kaushik"
 
 import importlib
