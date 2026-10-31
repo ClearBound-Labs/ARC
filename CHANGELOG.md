@@ -10,6 +10,13 @@ Based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) · [Semantic V
 
 ---
 
+## [5.2.0.post4] - 2026-10-31
+
+Documentation only. No code changes besides the version number.
+
+- PyPI lists both Aryan Kaushik and Mitul Gupta as authors
+- README version badge refreshes hourly
+
 ## [5.2.0.post3] - 2026-10-31
 
 Documentation only. No code changes besides the version number.
