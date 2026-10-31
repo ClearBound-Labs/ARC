@@ -339,19 +339,6 @@ Full workflow and standards: **[CONTRIBUTING.md](https://github.com/a-kaushik220
 
 ---
 
-## Citation
-
-```bibtex
-@article{kaushik2026arc,
-  title   = {ARC: Autonomous Recovery Controller for Fault-Tolerant Neural Network Training},
-  author  = {Kaushik, Aryan},
-  year    = {2026},
-  note    = {Maharaja Agrasen Institute of Technology, New Delhi}
-}
-```
-
----
-
 <div align="center">
 
 ### Built by [ClearBound Labs](https://clearboundlabs.com/)
